@@ -1,0 +1,31 @@
+{
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "uv: sync",
+      "type": "shell",
+      "command": "uv sync",
+      "problemMatcher": []
+    },
+    {
+      "label": "lint (ruff)",
+      "type": "shell",
+      "command": "uv run ruff check .",
+      "group": "build",
+      "problemMatcher": []
+    },
+    {
+      "label": "format (black)",
+      "type": "shell",
+      "command": "uv run black .",
+      "problemMatcher": []
+    },
+    {
+      "label": "tests (pytest)",
+      "type": "shell",
+      "command": "uv run pytest -q",
+      "problemMatcher": []
+    }
+  ]
+}
+
