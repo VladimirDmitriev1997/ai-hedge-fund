@@ -27,7 +27,7 @@ This project exposes a set of **pure, vectorized** features for OHLCV time serie
 
 ## Notation
 
-Let `C_t` be the **close** price at time `t` (index strictly increasing, UTC).  
+Let `C_t` be the **close** price at time `t`.  
 Let `H_t, L_t` be high/low, and `V_t` volume.  
 Window sizes are integers `n >= 1`. Exponentially weighted objects use span `s >= 1` with
 
@@ -262,5 +262,5 @@ bb      = bollinger_bands(close, 20, 2.0)
 feat = feat.join(macd_df).join(bb)
 feat["atr14"] = atr(high, low, close, 14)
 
-# Use these features in your signal(s) or ML pipeline
+
 

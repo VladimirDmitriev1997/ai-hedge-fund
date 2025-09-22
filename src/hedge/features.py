@@ -11,6 +11,7 @@ from typing import Literal, Tuple
 
 import numpy as np
 import pandas as pd
+from hedge.utils import ensure_series
 
 __all__ = [
     # sanity utilities
@@ -44,30 +45,6 @@ __all__ = [
 # ---------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------
-
-
-def ensure_series(x: pd.Series, name: str | None = None) -> pd.Series:
-    """
-    Ensure the input is a float Series with a proper name.
-
-    Parameters
-    ----------
-    x : pd.Series
-        Input series-like (assumed already aligned as needed).
-    name : str or None
-        Optional replacement name.
-
-    Returns
-    -------
-    pd.Series
-        Float64 series aligned to the original index.
-    """
-    if not isinstance(x, pd.Series):
-        raise TypeError("Expected a pandas Series.")
-    out = pd.to_numeric(x, errors="coerce")
-    if name is not None:
-        out = out.rename(name)
-    return out.astype(float)
 
 
 def lag(x: pd.Series, k: int = 1) -> pd.Series:
@@ -330,9 +307,10 @@ def macd(
     fast_span: int = 12,
     slow_span: int = 26,
     signal_span: int = 9,
+    ppo: bool = False,
 ) -> pd.DataFrame:
     """
-    Moving Average Convergence/Divergence (MACD).
+    Moving Average Convergence/Divergence (MACD) or PPO.
 
     Parameters
     ----------
@@ -344,26 +322,37 @@ def macd(
         Slow EMA span.
     signal_span : int, default 9
         EMA span for the signal line.
+    ppo : bool, default False
+        If True, use PPO core = (EMA_fast - EMA_slow) / EMA_slow (scale-invariant).
 
     Returns
     -------
     pd.DataFrame
         Columns:
-        - macd : EMA_fast - EMA_slow
-        - signal : EMA(macd, signal_span)
-        - hist : macd - signal
+        - macd/ppo : core line (MACD or PPO)
+        - signal   : EMA(core, signal_span)
+        - hist     : core - signal
     """
     if not (fast_span >= 1 and slow_span >= 1 and signal_span >= 1):
         raise ValueError("all spans must be >= 1")
     c = ensure_series(close, "close")
     ema_fast = ema(c, fast_span)
     ema_slow = ema(c, slow_span)
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(
+
+    diff = ema_fast - ema_slow
+    if ppo:
+        denom = ema_slow.mask(ema_slow == 0)  # защита от деления на ноль
+        core = diff / denom
+        core_name = "ppo"
+    else:
+        core = diff
+        core_name = "macd"
+
+    signal_line = core.ewm(
         span=signal_span, adjust=False, min_periods=signal_span
     ).mean()
-    hist = macd_line - signal_line
-    return pd.DataFrame({"macd": macd_line, "signal": signal_line, "hist": hist})
+    hist = core - signal_line
+    return pd.DataFrame({core_name: core, "signal": signal_line, "hist": hist})
 
 
 # ---------------------------------------------------------------------
