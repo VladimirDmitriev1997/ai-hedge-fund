@@ -1,5 +1,5 @@
 """
-Feature engineering utilities for time-series (OHLCV) research.
+Feature engineering utilities for time-series
 
 
 - All functions are vectorized, and return objects aligned to input index.

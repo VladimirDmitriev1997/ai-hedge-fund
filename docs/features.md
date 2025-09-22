@@ -1,7 +1,6 @@
 # Feature Library (OHLCV) — Theory & Formulas
 
 This project exposes a set of **pure, vectorized** features for OHLCV time series.  
-They are designed for **research reproducibility** (deterministic, aligned, documented).
 
 ## Contents
 - [Notation](#notation)
@@ -28,41 +27,35 @@ They are designed for **research reproducibility** (deterministic, aligned, docu
 
 ## Notation
 
-Let \( C_t \) be the **close** price at time \( t \) (index strictly increasing, UTC).  
-Let \( H_t, L_t \) be high/low, and \( V_t \) volume.  
-Window sizes are integers \( n \ge 1 \). Exponentially weighted objects use span \( s \ge 1 \) with
-\[
-\alpha = \frac{2}{s+1} \quad\text{(EMA smoothing factor)}.
-\]
+Let `C_t` be the **close** price at time `t` (index strictly increasing, UTC).  
+Let `H_t, L_t` be high/low, and `V_t` volume.  
+Window sizes are integers `n >= 1`. Exponentially weighted objects use span `s >= 1` with
+
+`alpha = 2/(s+1)`  (EMA smoothing factor).
+
 All rolling objects return **NaN** during warm-up periods.
 
 ---
 
 ## Returns
 
-**Simple returns**
-\[
-r_t \;=\; \frac{C_t}{C_{t-1}} - 1.
-\]
+**Simple returns**  
+`r_t = C_t / C_{t-1} - 1`
 
-**Log returns**
-\[
-\ell_t \;=\; \log C_t \;-\; \log C_{t-1}.
-\]
+**Log returns**  
+`ell_t = ln(C_t) - ln(C_{t-1})`
 
-> Use log returns when aggregating across time; use simple returns for backtests that compound equity as \( E_{t+1} = E_t (1 + r_{t+1}) \).
+> Use log returns when aggregating across time; use simple returns for backtests that compound equity as `E_{t+1} = E_t * (1 + r_{t+1})`.
 
 ---
 
 ## Averages & Smoothing
 
 ### Simple Moving Average (SMA)
-\[
-\operatorname{SMA}_t(n) \;=\; \frac{1}{n}\sum_{i=0}^{n-1} C_{t-i}.
-\]
+`SMA_t(n) = (1/n) * sum_{i=0..n-1} C_{t-i}`
 
 - Smooths noise uniformly.  
-- Warm-up: first \( n-1 \) values are NaN.
+- Warm-up: first `n-1` values are NaN.
 
 **Code:** `sma(close, window=n)`
 
@@ -70,11 +63,9 @@ r_t \;=\; \frac{C_t}{C_{t-1}} - 1.
 
 ### Exponential Moving Average (EMA)
 
-Define \( \alpha = \tfrac{2}{s+1} \) for span \( s \). Then
-\[
-\operatorname{EMA}_t(s) \;=\; \alpha\, C_t \;+\; (1-\alpha)\,\operatorname{EMA}_{t-1}(s), \qquad
-\operatorname{EMA}_0(s) = C_0 \;\; \text{(or the first available mean)}.
-\]
+Define `alpha = 2/(s+1)` for span `s`. Then  
+`EMA_t(s) = alpha * C_t + (1-alpha) * EMA_{t-1}(s)`, with  
+`EMA_0(s) = C_0` (or the first available mean).
 
 - Reacts faster than SMA (more weight to recent observations).  
 - In pandas: `ewm(span=s, adjust=False)`.
@@ -85,11 +76,8 @@ Define \( \alpha = \tfrac{2}{s+1} \) for span \( s \). Then
 
 ### Weighted Moving Average (WMA)
 
-Linearly weighted over the window (recent points heavier):
-\[
-\operatorname{WMA}_t(n) \;=\; \frac{\sum_{i=1}^{n} i \cdot C_{t-n+i}}
-{\sum_{i=1}^{n} i } \;=\; \frac{\sum_{i=1}^{n} i \cdot C_{t-n+i}}{n(n+1)/2}.
-\]
+Linearly weighted over the window (recent points heavier):  
+`WMA_t(n) = [ sum_{i=1..n} i * C_{t-n+i} ] / [ n*(n+1)/2 ]`
 
 **Code:** `wma(close, window=n)`
 
@@ -99,15 +87,11 @@ Linearly weighted over the window (recent points heavier):
 
 ### Rolling Volatility
 
-Population-like rolling standard deviation of a series \( x_t \) (often returns):
-\[
-\sigma_t(n) \;=\; 
-\sqrt{ \frac{1}{n} \sum_{i=0}^{n-1} \big(x_{t-i} - \bar{x}_t\big)^2 },
-\qquad
-\bar{x}_t \;=\; \operatorname{SMA}_t(n).
-\]
+Population-like rolling standard deviation of a series `x_t` (often returns):  
+`sigma_t(n) = sqrt( (1/n) * sum_{i=0..n-1} (x_{t-i} - xbar_t)^2 )`,  
+where `xbar_t = SMA_t(n)`.
 
-(If you use sample std, replace \( \tfrac{1}{n} \) by \( \tfrac{1}{n-1} \), i.e., \( \text{ddof}=1 \).)
+(If you use sample std, replace `1/n` by `1/(n-1)`, i.e., `ddof=1`.)
 
 **Code:** `rolling_vol(x, window=n, ddof=0)`
 
@@ -117,24 +101,20 @@ Population-like rolling standard deviation of a series \( x_t \) (often returns)
 
 Two equivalent presentations are common:
 
-**(A) Centered EWMA (mean + variance)**
-\[
-\begin{aligned}
-m_t \;&=\; (1-\alpha)\,m_{t-1} + \alpha\, x_t,\\
-v_t \;&=\; (1-\alpha)\,v_{t-1} + \alpha\, (x_t - m_t)^2,\\
-\sigma^{\text{EWMA}}_t \;&=\; \sqrt{v_t},
-\end{aligned}
-\]
-with \( \alpha = 2/(s+1) \).
+**(A) Centered EWMA (mean + variance)**  
 
-**(B) RiskMetrics variance recursion (zero-mean assumption)**
-\[
-\sigma_t^2 \;=\; \lambda\, \sigma_{t-1}^2 \;+\; (1-\lambda)\, x_t^2,
-\]
-where \( \lambda \approx 0.94 \) for daily data (original recommendation).  
-Relation between forms: \( \lambda = 1 - \alpha \).
+`m_t = (1-alpha) * m_{t-1} + alpha * x_t`
+`v_t = (1-alpha) * v_{t-1} + alpha * (x_t - m_t)^2`
+`sigma_t = sqrt(v_t)`
 
-**Initialization:** set \( m_0 = x_0 \), \( v_0 = 0 \) (or sample estimates from the first window).
+with `alpha = 2/(s+1)`.
+
+**(B) RiskMetrics variance recursion (zero-mean assumption)**  
+`sigma_t^2 = lambda * sigma_{t-1}^2 + (1-lambda) * x_t^2`,  
+where `lambda ≈ 0.94` for daily data (original recommendation).  
+Relation between forms: `lambda = 1 - alpha`.
+
+**Initialization:** set `m_0 = x_0`, `v_0 = 0` (or sample estimates from the first window).
 
 **Code:** `ewma_vol(x, span=s)`
 
@@ -142,11 +122,9 @@ Relation between forms: \( \lambda = 1 - \alpha \).
 
 ### Z-score
 
-\[
-z_t(n) \;=\; \frac{x_t - \operatorname{SMA}_t(n)}{\operatorname{Std}_t(n)}.
-\]
+`z_t(n) = (x_t - SMA_t(n)) / Std_t(n)`
 
-- If \( \operatorname{Std}_t(n)=0 \), define \( z_t=\text{NaN} \) to avoid infinities.  
+- If `Std_t(n)=0`, define `z_t = NaN` to avoid infinities.  
 - Useful for normalization and mean-reversion features.
 
 **Code:** `zscore(x, window=n)`
@@ -157,18 +135,17 @@ z_t(n) \;=\; \frac{x_t - \operatorname{SMA}_t(n)}{\operatorname{Std}_t(n)}.
 
 ### Relative Strength Index (RSI, Wilder)
 
-Let \( \Delta_t = C_t - C_{t-1} \), gains \( G_t = \max(\Delta_t, 0) \), losses \( L_t = \max(-\Delta_t, 0) \).  
-Wilder’s smoothing uses \( \alpha = 1/n \) with the **recursive** averages
-\[
-\begin{aligned}
-\operatorname{AG}_t &= (1-\alpha)\,\operatorname{AG}_{t-1} + \alpha\, G_t,\\
-\operatorname{AL}_t &= (1-\alpha)\,\operatorname{AL}_{t-1} + \alpha\, L_t,\\
-\text{RS}_t &= \frac{\operatorname{AG}_t}{\operatorname{AL}_t},\qquad
-\text{RSI}_t = 100 - \frac{100}{1+\text{RS}_t}.
-\end{aligned}
-\]
+Let `Delta_t = C_t - C_{t-1}`, gains `G_t = max(Delta_t, 0)`, losses `L_t = max(-Delta_t, 0)`.  
+Wilder’s smoothing uses `alpha = 1/n` with the **recursive** averages
 
-**Initialization:** compute AG/AL from the first \( n \) observations (simple averages), then apply the recursion.
+
+`AG_t = (1-alpha) * AG_{t-1} + alpha * G_t`
+`AL_t = (1-alpha) * AL_{t-1} + alpha * L_t`
+`RS_t = AG_t / AL_t`
+`RSI_t = 100 - 100 / (1 + RS_t)`
+
+
+**Initialization:** compute AG/AL from the first `n` observations (simple averages), then apply the recursion.
 
 **Code:** `rsi(close, window=14)`
 
@@ -176,13 +153,13 @@ Wilder’s smoothing uses \( \alpha = 1/n \) with the **recursive** averages
 
 ### MACD
 
-\[
-\operatorname{MACD}_t \;=\; \operatorname{EMA}_t(s_{\text{fast}}) \;-\; \operatorname{EMA}_t(s_{\text{slow}}),\qquad
-\text{signal}_t \;=\; \operatorname{EMA}_t( \operatorname{MACD}, s_{\text{sig}} ),\qquad
-\text{hist}_t \;=\; \operatorname{MACD}_t \;-\; \text{signal}_t.
-\]
+`MACD_t = EMA_t(s_fast) - EMA_t(s_slow)`
+`signal_t = EMA_t(MACD, s_sig)`
+`hist_t = MACD_t - signal_t`
 
-Default spans: \( 12, 26, 9 \).  
+
+
+Default spans: `12, 26, 9`.  
 **Initialization:** each EMA initialized as in the EMA section.
 
 **Code:** `macd(close, fast_span=12, slow_span=26, signal_span=9)`  
@@ -194,23 +171,17 @@ Default spans: \( 12, 26, 9 \).
 
 ### Bollinger Bands
 
-\[
-\begin{aligned}
-\text{mid}_t &= \operatorname{SMA}_t(n), \quad
-\text{sd}_t = \operatorname{Std}_t(n),\\
-\text{upper}_t &= \text{mid}_t + k\,\text{sd}_t, \quad
-\text{lower}_t = \text{mid}_t - k\,\text{sd}_t.
-\end{aligned}
-\]
+`mid_t = SMA_t(n)`
+`sd_t = Std_t(n)`
+`upper_t = mid_t + k * sd_t`
+`lower_t = mid_t - k * sd_t`
 
-Auxiliary measures:
-\[
-\text{bandwidth}_t = \frac{\text{upper}_t - \text{lower}_t}{\text{mid}_t},
-\qquad
-\%b_t = \frac{C_t - \text{lower}_t}{\text{upper}_t - \text{lower}_t}.
-\]
 
-Typical \( n=20 \), \( k=2 \).
+Auxiliary measures:  
+`bandwidth_t = (upper_t - lower_t) / mid_t`,  
+`%b_t = (C_t - lower_t) / (upper_t - lower_t)`.
+
+Typical `n=20`, `k=2`.
 
 **Code:** `bollinger_bands(close, window=20, num_std=2.0)`
 
@@ -218,20 +189,13 @@ Typical \( n=20 \), \( k=2 \).
 
 ### True Range & ATR
 
-**True Range (per bar):**
-\[
-\operatorname{TR}_t \;=\; \max\!\Big( 
-H_t - L_t,\; \big|H_t - C_{t-1}\big|,\; \big|L_t - C_{t-1}\big|
-\Big).
-\]
+**True Range (per bar):**  
+`TR_t = max( H_t - L_t, |H_t - C_{t-1}|, |L_t - C_{t-1}| )`
 
-**Average True Range (Wilder, \( \alpha=1/n \)):**
-\[
-\operatorname{ATR}_t(n) \;=\; (1-\alpha)\,\operatorname{ATR}_{t-1}(n) \;+\; \alpha\, \operatorname{TR}_t,
-\qquad \alpha = \frac{1}{n}.
-\]
+**Average True Range (Wilder, alpha=1/n):**  
+`ATR_t(n) = (1-alpha) * ATR_{t-1}(n) + alpha * TR_t`, with `alpha = 1/n`.
 
-**Initialization:** \( \operatorname{ATR}_{n} = \frac{1}{n}\sum_{i=1}^{n}\operatorname{TR}_i \).
+**Initialization:** `ATR_n = (1/n) * sum_{i=1..n} TR_i`.
 
 **Code:** `true_range(high, low, close)` and `atr(high, low, close, window=14)`
 
@@ -239,13 +203,9 @@ H_t - L_t,\; \big|H_t - C_{t-1}\big|,\; \big|L_t - C_{t-1}\big|
 
 ## Rolling Extrema / Sums
 
-\[
-\begin{aligned}
-\operatorname{RollMin}_t(n) &= \min\{x_{t-i}\}_{i=0}^{n-1},\\
-\operatorname{RollMax}_t(n) &= \max\{x_{t-i}\}_{i=0}^{n-1},\\
-\operatorname{RollSum}_t(n) &= \sum_{i=0}^{n-1} x_{t-i}.
-\end{aligned}
-\]
+`RollMin_t(n) = min{ x_{t-i} : i = 0..n-1 }`  
+`RollMax_t(n) = max{ x_{t-i} : i = 0..n-1 }`  
+`RollSum_t(n) = sum_{i=0..n-1} x_{t-i}`
 
 **Code:** `rolling_min(x,n)`, `rolling_max(x,n)`, `rolling_sum(x,n)`
 
