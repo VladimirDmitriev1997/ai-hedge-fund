@@ -20,14 +20,14 @@ Each strategy outputs a time-indexed DataFrame of **portfolio weights** that sum
 ## Notation
 
 - `W_t` — portfolio wealth right **before** rebalancing at time `t`.
-- `h_t` — vector of risky **dollar holdings** before rebalance at `t`.
+- `h_t` — vector of risky **holdings** before rebalance at `t`.
 - `P_t` — vector of execution prices used at `t` (e.g., next-bar open).
-- `C_t` — **cash** (dollar) balance before rebalance at `t`.
+- `C_t` — **cash** balance before rebalance at `t`.
 - `w_t` — **post-trade risky weights** applied over `[t, t+1]`.
 - `w_t_cash` — **post-trade cash weight** over `[t, t+1]`.
 - `r_{t+1}` — risky asset **gross** returns over `[t, t+1]` (fractional).
 - `r_f_{t,t+1}` — cash (risk-free) return over `[t, t+1]` (fractional).
-- `K_t` — fees/impact paid at `t` in **dollars**.
+- `K_t` — fees/impact paid at `t`.
 
 Weights are defined post-trade:
 
