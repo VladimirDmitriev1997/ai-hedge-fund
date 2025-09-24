@@ -1,16 +1,34 @@
 """
-Data loading and validation OHLCV time series.
+Data loading and validation for OHLCV time series, plus portfolio dataset builder.
 
-We assume CSV with columns:
-timestamp, open, high, low, close, volume
-- timestamp should be parseable to UTC-aware pandas.Datetime
-- rows must be sorted by time and duplicates removed
-- gaps are allowed
+Assumptions
+-----------
+CSV schema: timestamp, open, high, low, close, volume
+- timestamp must parse to a tz-aware DatetimeIndex in UTC (or convertible).
+- rows are sorted strictly increasing by time; duplicates are removed.
+- gaps are allowed (no synthetic fill).
+
+New utilities
+-------------
+- fetch_binance_ohlcv_df(...) : pull OHLCV for one symbol/interval to a DataFrame.
+- build_and_save_portfolio_dataset(...):
+    * fetch multiple symbols,
+    * select per-symbol columns (e.g., close / ohlc / volume),
+    * outer-join into a single MultiIndex-column DataFrame: (symbol, field),
+    * save to CSV: portfolio_<code>.csv,
+    * append a line with metadata to portfolio_catalog.csv in the same directory.
+
+All numeric columns are float64. Index is tz-aware UTC, strictly increasing.
+
+Notes
+-----
+- Resampling helper uses right-closed bins (t_prev, t] which is typical for crypto.
+- For Binance klines, we set timestamp = kline closeTime (UTC).
 """
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Dict, Iterable, Literal, Mapping, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -21,6 +39,13 @@ import requests
 
 
 _BINANCE_BASE = "https://api.binance.com"
+
+ALLOWED_FIELDS: Tuple[str, ...] = ("open", "high", "low", "close", "volume")
+
+
+# ------------------------------------------------------------------------------
+# Core CSV loader
+# ------------------------------------------------------------------------------
 
 
 @dataclass(frozen=True)
@@ -46,61 +71,76 @@ def load_ohlcv_csv(scheme: DataScheme) -> pd.DataFrame:
 
     Returns
     -------
-    DataFrame with columns: open, high, low, close, volume
-    and a DatetimeIndex in UTC, strictly increasing, no duplicates.
+    DataFrame
+        Columns: open, high, low, close, volume (float64)
+        Index: tz-aware DatetimeIndex in UTC, strictly increasing, no duplicates.
 
     Notes
     -----
-    Use resample_ohlcv() below to change timeframe.
+    Use `resample_ohlcv()` to change timeframe.
     """
     path = Path(scheme.path)
-
     df = pd.read_csv(path)
 
-    # Basic schema sanity
+    # Schema check
     missing = set(scheme.expected_cols) - set(df.columns)
     if missing:
         raise ValueError(f"CSV {path} missing columns: {sorted(missing)}")
 
     ts = df["timestamp"]
 
-    # If timestamps are integers (epoch), we need to get unit (ns/ms/s). Heuristics for unit definition see in _infer_epoch_unit():
-    if np.issubdtype(ts.dtype, np.number):
+    # Parse timestamps
+    if pd.api.types.is_numeric_dtype(ts):
         unit = (
             _infer_epoch_unit(ts) if scheme.parse_unit == "auto" else scheme.parse_unit
         )
         dt = pd.to_datetime(ts.astype("int64"), unit=unit, utc=True)
     else:
-        # timestamps
         dt = pd.to_datetime(ts, utc=True, errors="coerce")
 
     if dt.isna().any():
         bad = int(dt.isna().sum())
         raise ValueError(f"Failed to parse {bad} timestamps in {path}.")
 
-    # normalize to UTC timezone - this timezone is expected
-    dt = dt.tz_convert(scheme.tz) if str(dt.dt.tz) != scheme.tz else dt
+    # Convert to desired timezone (default UTC)
+    if isinstance(dt, pd.DatetimeIndex):
+        if scheme.tz and (str(dt.tz) != scheme.tz):
+            dt = dt.tz_convert(scheme.tz)
+    else:
+        # Coerce to DatetimeIndex
+        dt = pd.DatetimeIndex(dt).tz_convert(scheme.tz)
 
+    # Numeric coercion → float64
     num_cols = ["open", "high", "low", "close", "volume"]
     for c in num_cols:
-        df[c] = pd.to_numeric(df[c], errors="coerce")
+        df[c] = pd.to_numeric(df[c], errors="coerce").astype("float64")
 
     out = df[num_cols].copy()
     out.index = pd.DatetimeIndex(dt, name="timestamp")
     out = out.sort_index()
     out = out[~out.index.duplicated(keep="last")]
 
-    # Prices non-negative, highs >= lows, volume >= 0
+    # Basic sanity checks
     if (out[["open", "high", "low", "close"]] < 0).any().any():
         raise ValueError("Negative price found — corrupted CSV?")
     if (out["high"] < out["low"]).any():
         raise ValueError("Row with high < low — corrupted OHLC?")
+    if (out["volume"] < 0).any():
+        raise ValueError("Negative volume found — corrupted CSV?")
 
-    # Drop rows with NaNs that we created during coercion
-    if out.isna().any().any():
+    # Drop rows with NaNs created during coercion
+    out = out.dropna(how="any")
 
-        out = out.dropna()
-
+    # Final dtype normalization
+    out = out.astype(
+        {
+            "open": "float64",
+            "high": "float64",
+            "low": "float64",
+            "close": "float64",
+            "volume": "float64",
+        }
+    )
     return out
 
 
@@ -117,19 +157,19 @@ def resample_ohlcv(
     Parameters
     ----------
     df : DataFrame
-        Must have columns open, high, low, close, volume and a tz-aware DatetimeIndex.
+        Columns open, high, low, close, volume; tz-aware DatetimeIndex.
     rule : str
         Pandas offset alias, e.g., '15min', '1h', '4h', '1D', '1W'.
     how : {'ohlc','close'}
         'ohlc'  -> proper OHLC aggregation
-        'close' -> just reindex to the new period taking last close; volume summed
+        'close' -> reindex to new period taking last close; volume summed
     label, closed : {'left','right'}
-        Control how bins are labeled and which edge is inclusive.
-        For crypto (24/7) (t_prev, t].
+        For crypto (24/7) we typically use right-closed bins: (t_prev, t].
 
     Returns
     -------
-    Resampled DataFrame with same columns.
+    DataFrame
+        Resampled with same columns; float64 dtypes.
     """
     if how == "ohlc":
         o = df["open"].resample(rule, label=label, closed=closed).first()
@@ -145,20 +185,22 @@ def resample_ohlcv(
     else:
         raise ValueError("how must be 'ohlc' or 'close'")
 
-    return out.dropna()
+    out = out.dropna(how="any")
+    return out.astype("float64")
 
 
-# ---- Helpers --------------------------------------------------------------------
+# ------------------------------------------------------------------------------
+# Binance helpers
+# ------------------------------------------------------------------------------
 
 
 def _infer_epoch_unit(ts: pd.Series) -> Literal["ns", "ms", "s"]:
     """
     Heuristic for integer epoch timestamps:
-    - If values look like 13 digits -> milliseconds
-    - 10 digits -> seconds
-    - 19 digits -> nanoseconds
+    - 19+ digits -> nanoseconds
+    - 13-18 digits -> milliseconds
+    - else -> seconds
     """
-    # take a first non-NaN
     x = int(pd.Series(ts).dropna().iloc[0])
     n = len(str(abs(x)))
     if n >= 19:
@@ -170,30 +212,25 @@ def _infer_epoch_unit(ts: pd.Series) -> Literal["ns", "ms", "s"]:
 
 def _to_ms(dt_like: str | int | float | datetime | None) -> Optional[int]:
     """
-    Convert many date-like inputs to milliseconds.
+    Convert a variety of date-like inputs to milliseconds since epoch (UTC).
 
-    Parameters
-    ----------
-    dt_like: accepts
-      - None
-      - datetime (naive or tz-aware)
-      - epoch as int/float (s/ms/ns)
-      - string: ISO-like "YYYY-MM-DD[ HH:MM[:SS]]", or numeric epoch string
-
-    Returns
-    ----------
-    Input converted to milliseconds
+    Accepts
+    -------
+    - None
+    - datetime (naive or tz-aware)
+    - epoch as int/float (s/ms/ns)
+    - string: ISO-like "YYYY-MM-DD[ HH:MM[:SS]]", or numeric epoch string
     """
     if dt_like is None:
         return None
 
-    # datetime to ms
+    # datetime → ms
     if isinstance(dt_like, datetime):
         if dt_like.tzinfo is None:
             dt_like = dt_like.replace(tzinfo=timezone.utc)
         return int(dt_like.timestamp() * 1000)
 
-    # numpy scalars (e.g., np.int64) - treat like Python numbers
+    # numpy scalars (e.g., np.int64)
     if isinstance(dt_like, (np.integer, np.floating)):
         dt_like = dt_like.item()
 
@@ -204,56 +241,55 @@ def _to_ms(dt_like: str | int | float | datetime | None) -> Optional[int]:
         ts = pd.to_datetime(x, unit=unit, utc=True)
         return int(ts.to_datetime64().astype("datetime64[ms]").astype("int64"))
 
-    # tring:
+    # string
     if isinstance(dt_like, str):
         s = dt_like.strip()
-
         s_compact = re.sub(r"[ _]", "", s)
         if re.fullmatch(r"[+-]?\d{9,}", s_compact):
             x = int(s_compact)
             unit = _infer_epoch_unit(pd.Series([x]))
             ts = pd.to_datetime(x, unit=unit, utc=True)
             return int(ts.to_datetime64().astype("datetime64[ms]").astype("int64"))
-
-        # ISO-like calendar string
         ts = pd.to_datetime(s, utc=True, errors="coerce")
         if pd.isna(ts):
             raise ValueError(f"Cannot parse datetime string: {dt_like!r}")
         return int(ts.to_datetime64().astype("datetime64[ms]").astype("int64"))
 
-    # Fallback: unsupported type
     raise TypeError(f"Unsupported datetime-like type: {type(dt_like)!r}")
 
 
-def download_binance_ohlcv_csv(
+def fetch_binance_ohlcv_df(
     symbol: str = "BTCUSDT",
     interval: str = "1h",
     start: str | int | float | datetime | None = "2022-01-01",
     end: str | int | float | datetime | None = None,
-    out_path: str | Path = "data/BTCUSDT_1h.csv",
+    *,
     limit_per_call: int = 1000,
     request_pause_sec: float = 0.25,
-) -> Path:
+) -> pd.DataFrame:
     """
-    Download OHLCV from Binance API and save as CSV with columns:
-    timestamp,open,high,low,close,volume
+    Download OHLCV from Binance API into a DataFrame with UTC DatetimeIndex.
 
     Parameters
     ----------
-    symbol : for example 'BTCUSDT'
-    interval : '1m','5m','15m','1h','4h','1d'
-    start, end : inclusive time range (string like '2022-01-01', epoch s/ms, or datetime)
-    out_path : destination CSV path
-    limit_per_call : Binance max items per request
-    request_pause_sec : small sleep to be polite and avoid 429s
+    symbol : str
+        e.g., 'BTCUSDT'
+    interval : str
+        One of Binance klines intervals: '1m','5m','15m','1h','4h','1d', etc.
+    start, end : Any
+        Inclusive time range; string date, epoch s/ms/ns, or datetime.
+        If `end` is None, uses now (UTC).
+    limit_per_call : int
+        Max klines per request (≤ 1000).
+    request_pause_sec : float
+        Sleep between requests to avoid 429s.
 
-    Notes
-    -----
-    - We keep only OHLCV and set timestamp = closeTime (UTC).
+    Returns
+    -------
+    pd.DataFrame
+        Columns: open, high, low, close, volume (float64);
+        Index: timestamp at kline closeTime (UTC), strictly increasing.
     """
-    out_path = Path(out_path)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
     start_ms = _to_ms(start)
     end_ms = _to_ms(end) if end is not None else _to_ms(datetime.now(timezone.utc))
 
@@ -261,7 +297,7 @@ def download_binance_ohlcv_csv(
     params = {
         "symbol": symbol.upper(),
         "interval": interval,
-        "limit": min(limit_per_call, 1000),
+        "limit": min(int(limit_per_call), 1000),
     }
 
     rows: list[tuple[int, str, str, str, str, str]] = []
@@ -281,8 +317,7 @@ def download_binance_ohlcv_csv(
         # Each kline: [ openTime, open, high, low, close, volume, closeTime, ... ]
         for k in data:
             close_time_ms = int(k[6])
-            # stop if we exceeded end
-            if close_time_ms > end_ms:
+            if close_time_ms > end_ms:  # guard overshoot
                 break
             rows.append(
                 (
@@ -295,11 +330,10 @@ def download_binance_ohlcv_csv(
                 )
             )
 
-        # If we received less than the limit, we reached the end
+        # If fewer than limit, we're done
         if len(data) < params["limit"]:
             break
 
-        # Otherwise advance start to the last close_time
         last_close_ms = int(data[-1][6])
         if last_close_ms >= end_ms:
             break
@@ -310,21 +344,381 @@ def download_binance_ohlcv_csv(
     if not rows:
         raise RuntimeError("No data returned for the requested range.")
 
-    # Build DataFrame and write CSV compatible with our loader
     df = pd.DataFrame(
         rows, columns=["close_time_ms", "open", "high", "low", "close", "volume"]
     )
-    # Convert close_time_ms to ISO UTC strings
-    ts = pd.to_datetime(df["close_time_ms"], unit="ms", utc=True)
-    df_out = pd.DataFrame(
+    ts = pd.to_datetime(df["close_time_ms"].astype("int64"), unit="ms", utc=True)
+    out = pd.DataFrame(
         {
-            "timestamp": ts.dt.strftime("%Y-%m-%dT%H:%M:%SZ"),
-            "open": pd.to_numeric(df["open"], errors="coerce"),
-            "high": pd.to_numeric(df["high"], errors="coerce"),
-            "low": pd.to_numeric(df["low"], errors="coerce"),
-            "close": pd.to_numeric(df["close"], errors="coerce"),
-            "volume": pd.to_numeric(df["volume"], errors="coerce"),
-        }
+            "open": pd.to_numeric(df["open"], errors="coerce").astype("float64"),
+            "high": pd.to_numeric(df["high"], errors="coerce").astype("float64"),
+            "low": pd.to_numeric(df["low"], errors="coerce").astype("float64"),
+            "close": pd.to_numeric(df["close"], errors="coerce").astype("float64"),
+            "volume": pd.to_numeric(df["volume"], errors="coerce").astype("float64"),
+        },
+        index=pd.DatetimeIndex(ts, name="timestamp"),
+    ).sort_index()
+
+    # Sanity checks
+    out = out[~out.index.duplicated(keep="last")]
+    if (out[["open", "high", "low", "close"]] < 0).any().any():
+        raise ValueError(f"{symbol}: negative price found.")
+    if (out["high"] < out["low"]).any():
+        raise ValueError(f"{symbol}: high < low encountered.")
+    if (out["volume"] < 0).any():
+        raise ValueError(f"{symbol}: negative volume found.")
+
+    return out
+
+
+def download_binance_ohlcv_csv(
+    symbol: str = "BTCUSDT",
+    interval: str = "1h",
+    start: str | int | float | datetime | None = "2022-01-01",
+    end: str | int | float | datetime | None = None,
+    out_path: str | Path = "data/BTCUSDT_1h.csv",
+    limit_per_call: int = 1000,
+    request_pause_sec: float = 0.25,
+) -> Path:
+    """
+    Convenience wrapper: fetch Binance OHLCV and save as CSV with columns:
+    timestamp,open,high,low,close,volume (timestamp in ISO UTC).
+
+    Notes
+    -----
+    - Timestamp equals kline closeTime.
+    """
+    out_path = Path(out_path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    df = fetch_binance_ohlcv_df(
+        symbol=symbol,
+        interval=interval,
+        start=start,
+        end=end,
+        limit_per_call=limit_per_call,
+        request_pause_sec=request_pause_sec,
     )
-    df_out.to_csv(out_path, index=False)
+    df_out = df.copy()
+    df_out = df_out.reset_index()
+    df_out["timestamp"] = df_out["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    df_out[["timestamp", "open", "high", "low", "close", "volume"]].to_csv(
+        out_path, index=False
+    )
     return out_path
+
+
+# ------------------------------------------------------------------------------
+# Portfolio dataset builder + catalog logging
+# ------------------------------------------------------------------------------
+
+
+def build_and_save_portfolio_dataset(
+    code: str,
+    symbols_fields: Mapping[str, Sequence[str]],
+    *,
+    interval: str = "1h",
+    start: str | int | float | datetime | None = "2022-01-01",
+    end: str | int | float | datetime | None = None,
+    out_dir: str | Path = "data",
+    limit_per_call: int = 1000,
+    request_pause_sec: float = 0.25,
+    join_how: Literal["outer", "inner"] = "outer",
+) -> Path:
+    """
+    Fetch multiple symbols and assemble a single MultiIndex-column DataFrame.
+
+    Parameters
+    ----------
+    code : str
+        Portfolio code used for file naming, e.g., "crypto_1h_2022".
+    symbols_fields : Mapping[str, Sequence[str]]
+        Dict of SYMBOL -> fields to keep (subset of {'open','high','low','close','volume'}).
+        Example: {'BTCUSDT': ['close','volume'], 'ETHUSDT': ['close']}
+    interval : str
+        Binance kline interval ('1m','5m','15m','1h','4h','1d', ...).
+    start, end : Any
+        Inclusive time range (string date, epoch s/ms/ns, or datetime).
+    out_dir : str | Path
+        Output directory. Two files are produced here:
+          - portfolio_<code>.csv
+          - portfolio_catalog.csv  (append-only metadata log)
+    limit_per_call, request_pause_sec : API pacing parameters.
+    join_how : {'outer','inner'}
+        Index join method across symbols (default outer to keep union of bars).
+
+    Returns
+    -------
+    Path
+        Path to the saved CSV dataset: <out_dir>/portfolio_<code>.csv
+
+    Side effects
+    ------------
+    Appends metadata to <out_dir>/portfolio_catalog.csv.
+    """
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    code_clean = re.sub(r"[^A-Za-z0-9_\-\.]", "_", code).strip("_")
+    out_path = out_dir / f"portfolio_{code_clean}.csv"
+    catalog_path = out_dir / "portfolio_catalog.csv"
+
+    # Validate fields spec
+    for sym, fields in symbols_fields.items():
+        bad = [f for f in fields if f not in ALLOWED_FIELDS]
+        if bad:
+            raise ValueError(f"{sym}: unsupported fields requested: {bad}")
+
+    # Fetch each symbol, select fields, rename to MultiIndex (sym, field)
+    frames: list[pd.DataFrame] = []
+    for sym, fields in symbols_fields.items():
+        df = fetch_binance_ohlcv_df(
+            symbol=sym,
+            interval=interval,
+            start=start,
+            end=end,
+            limit_per_call=limit_per_call,
+            request_pause_sec=request_pause_sec,
+        )
+        # Select requested fields
+        sub = df.loc[:, list(fields)].copy()
+        # MultiIndex columns (symbol, field)
+        sub.columns = pd.MultiIndex.from_product(
+            [[sym.upper()], list(fields)], names=["symbol", "field"]
+        )
+        frames.append(sub)
+
+    # Join along time
+    if not frames:
+        raise ValueError("symbols_fields is empty.")
+    df_all = frames[0]
+    for f in frames[1:]:
+        df_all = df_all.join(f, how=join_how)
+
+    # Ensure strictly increasing, tz-aware UTC index, float64 dtypes
+    df_all = df_all.sort_index()
+    df_all = df_all[~df_all.index.duplicated(keep="last")]
+    if not isinstance(df_all.index, pd.DatetimeIndex) or df_all.index.tz is None:
+        # Should not happen (we fetch in UTC), but enforce for consistency
+        df_all.index = pd.DatetimeIndex(df_all.index, tz="UTC", name="timestamp")
+
+    # Save CSV with index as ISO UTC string
+    df_out = df_all.copy()
+    df_out = df_out.reset_index()
+    df_out["timestamp"] = df_out["timestamp"].dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+    df_out.to_csv(out_path, index=False)
+
+    # Append to catalog
+    _append_portfolio_catalog(
+        catalog_path=catalog_path,
+        code=code_clean,
+        interval=interval,
+        start=start,
+        end=end,
+        symbols_fields=symbols_fields,
+        dataset_path=str(out_path),
+    )
+
+    return out_path
+
+
+def _append_portfolio_catalog(
+    catalog_path: Path,
+    *,
+    code: str,
+    interval: str,
+    start: str | int | float | datetime | None,
+    end: str | int | float | datetime | None,
+    symbols_fields: Mapping[str, Sequence[str]],
+    dataset_path: str,
+) -> None:
+    """
+    Append a single line of metadata to the portfolio catalog CSV.
+
+    Columns
+    -------
+    created_utc, code, interval, start, end, symbols, fields_per_symbol, dataset_path
+
+    - `symbols` is a semicolon-separated list like: "BTCUSDT;ETHUSDT"
+    - `fields_per_symbol` is a semicolon-separated list mirroring symbols, e.g.:
+         "close|volume;close"
+    """
+    created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    symbols = [s.upper() for s in symbols_fields.keys()]
+    fields_repr = ["|".join(map(str, symbols_fields[s])) for s in symbols_fields]
+
+    row = {
+        "created_utc": created,
+        "code": code,
+        "interval": interval,
+        "start": _repr_time_for_catalog(start),
+        "end": _repr_time_for_catalog(end),
+        "symbols": ";".join(symbols),
+        "fields_per_symbol": ";".join(fields_repr),
+        "dataset_path": dataset_path,
+    }
+
+    if catalog_path.exists():
+        cat = pd.read_csv(catalog_path)
+        cat = pd.concat([cat, pd.DataFrame([row])], ignore_index=True)
+    else:
+        cat = pd.DataFrame([row])
+    cat.to_csv(catalog_path, index=False)
+
+
+def _repr_time_for_catalog(x: str | int | float | datetime | None) -> str:
+    """Human-friendly ISO-ish representation for the catalog."""
+    if x is None:
+        return ""
+    if isinstance(x, datetime):
+        if x.tzinfo is None:
+            x = x.replace(tzinfo=timezone.utc)
+        return x.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Try epoch-like or parsable string
+    try:
+        ms = _to_ms(x)  # type: ignore[arg-type]
+        ts = pd.to_datetime(ms, unit="ms", utc=True)
+        return ts.strftime("%Y-%m-%dT%H:%M:%SZ")
+    except Exception:
+        return str(x)
+
+
+def load_portfolio_csv(
+    path: str | Path,
+    *,
+    tz: str = "UTC",
+    fields_required: Sequence[str] | None = ("close",),
+    flat_sep: str = "_",
+) -> pd.DataFrame:
+    """
+    Load a multi-asset 'portfolio_<code>.csv' back into a MultiIndex-column DataFrame.
+
+    Supports two header styles:
+      1) MultiIndex header rows (what build_and_save_portfolio_dataset writes):
+           timestamp  BTCUSDT                   ETHUSDT
+                      close  volume             close
+         ...rows...
+         -> columns MultiIndex: (symbol, field) with names ['symbol','field']
+      2) Flat columns like: timestamp, BTCUSDT_close, ETHUSDT_close, ...
+         -> will be split by `flat_sep` into (symbol, field) if field∈ALLOWED_FIELDS.
+
+    Parameters
+    ----------
+    path : str | Path
+        CSV path (produced by build_and_save_portfolio_dataset).
+    tz : str, default 'UTC'
+        Target timezone for DatetimeIndex.
+    fields_required : sequence[str] or None
+        If provided, validate each symbol has these fields (e.g., ('close',)).
+    flat_sep : str, default '_'
+        Separator for parsing fallback flat columns 'SYMBOL_field'.
+
+    Returns
+    -------
+    pd.DataFrame
+        MultiIndex columns (symbol, field), float64 dtypes, tz-aware UTC index.
+    """
+    path = Path(path)
+
+    # First try: MultiIndex header
+    try:
+        df = pd.read_csv(path, header=[0, 1])
+        # detect whether we really got a 2-level header (excluding the timestamp col)
+        cols = df.columns
+        is_multi = isinstance(cols, pd.MultiIndex)
+        if is_multi:
+            # timestamp column could be ('timestamp','') or ('timestamp','timestamp') depending on pandas
+            # Find any column whose top level equals 'timestamp'
+            ts_candidates = [
+                c
+                for c in cols
+                if (isinstance(c, tuple) and str(c[0]).lower() == "timestamp")
+            ]
+            if ts_candidates:
+                ts_col = ts_candidates[0]
+                ts = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+                if ts.isna().any():
+                    raise ValueError(
+                        "Failed to parse timestamps in portfolio CSV (multiheader)."
+                    )
+                X = df.drop(columns=[ts_col])
+                X.columns = pd.MultiIndex.from_tuples(
+                    [(str(a).upper(), str(b)) for (a, b) in X.columns],
+                    names=["symbol", "field"],
+                )
+                X.index = pd.DatetimeIndex(ts, name="timestamp")
+                # Normalize
+                X = X.sort_index()
+                X = X[~X.index.duplicated(keep="last")]
+                if tz and str(X.index.tz) != tz:
+                    X.index = X.index.tz_convert(tz)
+
+                # Dtypes
+                for c in X.columns:
+                    X[c] = pd.to_numeric(X[c], errors="coerce").astype("float64")
+                X = X.dropna(how="any")
+
+                # Optional field validation
+                if fields_required:
+                    req = set(fields_required)
+                    by_sym = X.columns.get_level_values("symbol").unique()
+                    for sym in by_sym:
+                        have = set(X.loc[:, sym].columns)
+                        missing = sorted(list(req - have))
+                        if missing:
+                            raise KeyError(f"{sym}: missing required fields {missing}")
+                return X
+    except Exception:
+        # fall through to flat header parser
+        pass
+
+    # Fallback: flat header like 'BTCUSDT_close'
+    df = pd.read_csv(path)
+    if "timestamp" not in df.columns:
+        raise ValueError("Portfolio CSV must include a 'timestamp' column.")
+    ts = pd.to_datetime(df["timestamp"], utc=True, errors="coerce")
+    if ts.isna().any():
+        raise ValueError("Failed to parse timestamps in portfolio CSV.")
+
+    # Build MultiIndex columns by splitting flat names
+    cols = [c for c in df.columns if c != "timestamp"]
+    tuples: list[tuple[str, str]] = []
+    bad: list[str] = []
+    for c in cols:
+        parts = str(c).rsplit(flat_sep, 1)
+        if len(parts) == 2 and parts[1] in ALLOWED_FIELDS:
+            tuples.append((parts[0].upper(), parts[1]))
+        else:
+            bad.append(c)
+    if not tuples:
+        raise ValueError(
+            "Could not detect MultiIndex columns. The CSV does not look like a portfolio export."
+        )
+    if bad:
+        # non-fatal: we ignore unknown columns
+        cols_ok = [c for c in cols if c not in bad]
+    else:
+        cols_ok = cols
+
+    X = df[cols_ok].copy()
+    X.columns = pd.MultiIndex.from_tuples(tuples, names=["symbol", "field"])
+    X.index = pd.DatetimeIndex(ts, name="timestamp")
+
+    # Normalize & dtypes
+    X = X.sort_index()
+    X = X[~X.index.duplicated(keep="last")]
+    if tz and str(X.index.tz) != tz:
+        X.index = X.index.tz_convert(tz)
+    for c in X.columns:
+        X[c] = pd.to_numeric(X[c], errors="coerce").astype("float64")
+    X = X.dropna(how="any")
+
+    if fields_required:
+        req = set(fields_required)
+        by_sym = X.columns.get_level_values("symbol").unique()
+        for sym in by_sym:
+            have = set(X.loc[:, sym].columns)
+            missing = sorted(list(req - have))
+            if missing:
+                raise KeyError(f"{sym}: missing required fields {missing}")
+
+    return X
