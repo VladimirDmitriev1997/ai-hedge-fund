@@ -22,17 +22,26 @@ Notes
   can be used with or without explicit prices/volumes.
 """
 
-
-from typing import Any, Optional, Tuple, Union
-from hedge.fitting.torch_utils import *
+from typing import Any, Optional, Tuple, Union, Mapping, Dict
 import numpy as np
+
+# Backend helpers (single source of truth)
+from hedge.fitting.torch_utils import (
+    as_array,
+    is_torch,
+    _zeros_like,
+    _ones_like,
+    _abs,
+    _sum,
+    _maximum,
+)
 
 try:
     import torch
     from torch import Tensor as TorchTensor
 
     _HAS_TORCH = True
-except Exception:
+except Exception:  # torch optional
     torch = None  # type: ignore
     TorchTensor = Any  # type: ignore
     _HAS_TORCH = False
@@ -50,6 +59,8 @@ __all__ = [
     "per_asset_funding_cost",
     # combos
     "sum_costs",
+    # registry
+    "COST_MODELS",
 ]
 
 
@@ -66,43 +77,52 @@ def turnover_matrix(
     """
     Construct per-period **changes in weights** ΔW_t (absolute turnover primitive).
 
-    delta W_0 = W_0 - W_{-1}  (use `initial_weights` or assume 0)
-    delta W_t = W_t - W_{t-1} for t>=1
+    Definition
+    ----------
+    ΔW_t = W_t - W_{t-1}  for t ≥ 1
+    ΔW_0 =
+        - 0                        if `initial_weights` is None
+        - W_0 - initial_weights    otherwise
 
     Parameters
     ----------
     weights : Array, shape (T, M)
         Full allocation matrix (rows ≈ simplex incl. CASH).
     initial_weights : Array or None, default None
-        Baseline for the first step. If None, assume zeros of shape (M,).
+        Baseline for the first step. If None, the first step turnover is set to 0.
 
     Returns
     -------
-    Array, shape (T, M)
-        delta W per period
+    Array
+        Per-period ΔW, shape (T, M).
+
+    Notes
+    -----
+    - This choice (ΔW_0 = 0 if baseline unknown) avoids charging costs on the very first
+      initialization step; pass `initial_weights` if you want to account for it explicitly.
     """
     W = as_array(weights)
     if W.ndim != 2:
         raise ValueError("weights must be 2D: (T, M)")
     T, M = W.shape
 
-    if initial_weights is None:
-        w_prev = (
-            torch.zeros((1, M), dtype=W.dtype, device=W.device)  # type: ignore[attr-defined]
-            if is_torch(W)
-            else np.zeros((1, M), dtype=W.dtype)
-        )
+    # Compute differences row-wise
+    if is_torch(W):
+        dw = torch.zeros_like(W)  # type: ignore[attr-defined]
+        dw[1:, :] = W[1:, :] - W[:-1, :]
     else:
+        dw = np.zeros_like(W)
+        dw[1:, :] = W[1:, :] - W[:-1, :]
+
+    # First row: either from explicit baseline, or zero
+    if initial_weights is not None:
         w_prev = as_array(initial_weights)
         if w_prev.ndim == 1:
             w_prev = w_prev.reshape(1, -1)
         if w_prev.shape != (1, M):
             raise ValueError("initial_weights must have shape (M,) or (1, M)")
-
-    if is_torch(W):
-        dw = torch.vstack((W[0:1, :] - w_prev, W[1:, :] - W[:-1, :]))  # type: ignore
-    else:
-        dw = np.vstack((W[0:1, :] - w_prev, W[1:, :] - W[:-1, :]))
+        dw[0:1, :] = W[0:1, :] - w_prev  # type: ignore[index]
+    # else: keep dw[0,:] = 0 by construction
     return dw
 
 
@@ -113,14 +133,21 @@ def l1_turnover_cost(
     slippage_bps: float = 0.0,
     per_asset_multipliers: Optional[Array] = None,
     initial_weights: Optional[Array] = None,
+    apply_half: bool = False,
 ) -> Array:
     """
     Linear (L1) turnover cost in rates, to subtract from returns.
 
     Model
     -----
-    cost_t = sum_j  |delta w_{t,j}| * κ_{t,j}
-      where κ_{t,j} = (fee_bps + slippage_bps)/1e4 * multiplier_{t,j}
+    cost_t = sum_j  |Δw_{t,j}| * κ_{t,j}
+      where κ_{t,j} = ((fee_bps + slippage_bps)/1e4) * multiplier_{t,j}
+
+    Optional ½ factor
+    -----------------
+    If `apply_half=True`, the model applies the industry convention ½·Σ|Δw|
+    (each traded dollar leaves one asset and enters another). Default False
+    keeps the original model unchanged.
 
     Parameters
     ----------
@@ -133,12 +160,14 @@ def l1_turnover_cost(
     per_asset_multipliers : Array or None, default None
         Optional scale (broadcast to (T, M)), e.g., spreads, tiers, vol.
     initial_weights : Array or None, default None
-        Baseline weights for the first turnover step.
+        Baseline weights for the first turnover step. If None → ΔW_0 = 0.
+    apply_half : bool, default False
+        Apply a ½ factor to Σ|Δw| if True.
 
     Returns
     -------
-    Array, shape (T,)
-        Per-period cost **rates**.
+    Array
+        Per-period cost **rates**, shape (T,).
     """
     W = as_array(weights)
     T, M = W.shape
@@ -149,11 +178,15 @@ def l1_turnover_cost(
     if kappa == 0.0 and per_asset_multipliers is None:
         return _zeros_like(W[:, 0])
 
+    # Optional ½ convention
+    if apply_half:
+        dw = dw * 0.5  # type: ignore[operator]
+
+    # Per-asset scaling (broadcast)
     if per_asset_multipliers is None:
         per_asset = dw * kappa
     else:
         mult = as_array(per_asset_multipliers)
-        # broadcast to (T, M)
         if is_torch(mult):
             if mult.ndim == 1:
                 if mult.numel() == M:
@@ -185,7 +218,7 @@ def power_turnover_cost(
     initial_weights: Optional[Array] = None,
 ) -> Array:
     """
-    Power-law turnover cost |delta w|^p (p in [1,2]) — a proxy for nonlinear impact.
+    Power-law turnover cost |Δw|^p (p in [1,2]) — a proxy for nonlinear impact.
 
     Model
     -----
@@ -202,20 +235,21 @@ def power_turnover_cost(
     per_asset_coeffs : Array or None, default None
         Optional (T,M) or broadcastable coefficients c_{t,j}.
     initial_weights : Array or None, default None
-        Baseline weights for first step.
+        Baseline weights for first step (ΔW_0 = 0 if None).
 
     Returns
     -------
-    Array, shape (T,)
-        Per-period cost rates.
+    Array
+        Per-period cost rates, shape (T,).
     """
     if exponent < 1.0:
         raise ValueError("exponent must be >= 1.0")
     W = as_array(weights)
     dw = _abs(turnover_matrix(W, initial_weights=initial_weights))
+
     # |Δw|^p
     if is_torch(dw):
-        mag = torch.pow(dw, exponent)  # type: ignore
+        mag = torch.pow(dw, exponent)  # type: ignore[attr-defined]
     else:
         mag = dw**exponent
 
@@ -252,8 +286,12 @@ def holding_short_borrow_cost(
 
     Returns
     -------
-    Array, shape (T,)
-        Per-period cost rates.
+    Array
+        Per-period cost rates, shape (T,).
+
+    Notes
+    -----
+    - CASH column contributes zero (w_{t,CASH} ≥ 0 by construction in typical setups).
     """
     W = as_array(weights)
     short_exposure = _maximum(0.0, -W)  # only pay on shorts
@@ -271,7 +309,7 @@ def leverage_funding_cost(
     funding_bps: float = 0.0,
 ) -> Array:
     """
-    Leverage funding cost based on gross exposure beyond 1.
+    Leverage funding cost based on **gross exposure** beyond 1.
 
     Model
     -----
@@ -288,12 +326,12 @@ def leverage_funding_cost(
 
     Returns
     -------
-    Array, shape (T,)
-        Per-period cost rates.
+    Array
+        Per-period cost rates, shape (T,).
     """
     W = as_array(weights)
     gross = _sum(_abs(W), axis=1)
-    excess = _maximum(0.0, gross - (1.0 if not is_torch(gross) else as_array(1.0)))
+    excess = _maximum(0.0, gross - 1.0)
     rate = float(funding_bps) / 1e4
     return excess * rate  # type: ignore[operator]
 
@@ -323,13 +361,12 @@ def per_asset_funding_cost(
 
     Returns
     -------
-    Array, shape (T,)
-        Per-period net funding (positive = cost to subtract; negative = income).
+    Array
+        Per-period net funding (positive = cost to subtract; negative = income), shape (T,).
     """
     W = as_array(weights)
     F = as_array(funding_rates)
-    # broadcast multiply and sum over assets
-    per_asset = W * F
+    per_asset = W * F  # broadcast multiply
     return _sum(per_asset, axis=1)
 
 
@@ -345,12 +382,12 @@ def sum_costs(*components: Array) -> Array:
     Parameters
     ----------
     components : Array
-        Any number of (T,) arrays/tensors.
+        Any number of (T,) arrays/tensors (backend may mix; will be coerced).
 
     Returns
     -------
-    Array, shape (T,)
-        Elementwise sum (backend preserved).
+    Array
+        Elementwise sum, shape (T,).
     """
     if len(components) == 0:
         raise ValueError("Provide at least one cost component.")
@@ -358,3 +395,16 @@ def sum_costs(*components: Array) -> Array:
     for c in components[1:]:
         acc = acc + as_array(c)
     return acc
+
+
+# ---------------------------------------------------------------------
+# Registry (public)
+# ---------------------------------------------------------------------
+
+COST_MODELS: Dict[str, callable] = {
+    "turnover": l1_turnover_cost,
+    "power_turnover": power_turnover_cost,
+    "short_borrow": holding_short_borrow_cost,
+    "leverage_funding": leverage_funding_cost,
+    "per_asset_funding": per_asset_funding_cost,
+}
