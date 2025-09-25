@@ -1,4 +1,39 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "ai-hedge-fund"
 version = "0.1.0"
+description = "Research-grade trading/backtesting toolkit"
+readme = "README.md"
+license = { file = "LICENSE" }
 requires-python = ">=3.11,<3.13"
+authors = [{ name = "Your Name" }]
+
+# Runtime deps (kept lean; torch is optional via extras)
+dependencies = [
+  "numpy>=1.26,<3",         # compatible with pandas 2.x and most torch builds
+  "pandas>=2.0,<3",
+  "requests>=2.31",
+  "matplotlib>=3.8,<4",     # 3.10.x doesn’t exist; 3.8+ is safe & modern
+]
+
+[project.optional-dependencies]
+# install with: uv pip install -e .[torch]
+torch = ["torch>=2.1"]
+
+[tool.setuptools.packages.find]
+where = ["src"]              # discovers src/hedge/*
+include = ["*"]
+exclude = ["tests*","docs*"]
+
+# ---- dev-only tools for contributors (uv uses this section) ----
+[dependency-groups]
+dev = [
+  "black>=24.0.0",
+  "ipykernel>=6.29",
+  "pytest>=8.0",
+  "ruff>=0.4",
+]
+

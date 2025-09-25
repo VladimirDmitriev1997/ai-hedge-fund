@@ -29,29 +29,101 @@ from typing import Any, Optional, Tuple, Union, Callable, Sequence, Mapping, Dic
 import warnings
 import numpy as np
 
-# Backend helpers (single source of truth)
-from hedge.fitting.torch_utils import (
-    _is_torch,
-    _as_array,
-    _zeros_like,
-    _ones_like,
-    _abs,
-    _sum,
-    _mean,
-    _std,
-    _log1p,
-    _clip,
-    _cumsum,
-    _cumprod,
-    _maximum,
-    _where,
-)
+# ---------------------------------------------------------------------
+# Backend helpers (single source of truth) + safe fallbacks
+# ---------------------------------------------------------------------
+
+# Try official backend helpers first
+try:
+    from hedge.fitting.torch_utils import (
+        _is_torch,
+        _as_array,
+        _zeros_like,
+        _ones_like,
+        _abs,
+        _sum,
+        _mean,
+        _std,
+        _log1p,
+        _clip,
+        _cumsum,
+        _cumprod,
+        _maximum,
+        _where,
+    )
+
+    _BACKEND_OK = True
+except Exception:  # pragma: no cover
+    _BACKEND_OK = False
+
+    # Minimal NumPy fallbacks to keep this module functional if torch_utils
+    # hasn't been wired yet. These mimic the used signatures.
+    def _is_torch(x: Any) -> bool:
+        return False
+
+    def _as_array(x: Any) -> np.ndarray:
+        return np.asarray(x)
+
+    def _zeros_like(x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x)
+        return np.zeros_like(x)
+
+    def _ones_like(x: np.ndarray) -> np.ndarray:
+        x = np.asarray(x)
+        return np.ones_like(x)
+
+    def _abs(x: np.ndarray) -> np.ndarray:
+        return np.abs(np.asarray(x))
+
+    def _sum(x: np.ndarray, axis: Optional[int] = None) -> np.ndarray:
+        return np.sum(np.asarray(x), axis=axis)
+
+    def _mean(x: np.ndarray, axis: Optional[int] = None) -> np.ndarray:
+        return np.mean(np.asarray(x), axis=axis)
+
+    def _std(x: np.ndarray, axis: Optional[int] = None) -> np.ndarray:
+        return np.std(np.asarray(x), axis=axis)
+
+    def _log1p(x: np.ndarray) -> np.ndarray:
+        return np.log1p(np.asarray(x))
+
+    def _clip(x: np.ndarray, lo: float, hi: float) -> np.ndarray:
+        return np.clip(np.asarray(x), lo, hi)
+
+    def _cumsum(x: np.ndarray, axis: int = 0) -> np.ndarray:
+        return np.cumsum(np.asarray(x), axis=axis)
+
+    def _cumprod(x: np.ndarray, axis: int = 0) -> np.ndarray:
+        return np.cumprod(np.asarray(x), axis=axis)
+
+    def _maximum(a: np.ndarray, b: np.ndarray | float) -> np.ndarray:
+        return np.maximum(np.asarray(a), np.asarray(b))
+
+    def _where(cond: np.ndarray, a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        return np.where(cond, a, b)
+
+    warnings.warn(
+        "hedge.fitting.torch_utils not available; using NumPy fallbacks inside losses.py.",
+        stacklevel=2,
+    )
 
 from hedge.portfolio import _align_weights_and_returns, portfolio_returns
 
-
 # Cost models registry (expected to be defined in cost_models.py)
-from hedge.fitting.cost_models import COST_MODELS  # exposes dict[str, callable]
+try:
+    from hedge.fitting.cost_models import COST_MODELS  # exposes dict[str, callable]
+
+    if not isinstance(COST_MODELS, dict):
+        raise TypeError("COST_MODELS must be a dict.")
+    _HAS_COST_REGISTRY = True
+except Exception:  # pragma: no cover
+    COST_MODELS: Dict[str, Callable[..., Any]] = {}
+    _HAS_COST_REGISTRY = False
+    warnings.warn(
+        "COST_MODELS registry not found (hedge.fitting.cost_models). "
+        "cost_config will be ignored unless you pass explicit cost callables.",
+        stacklevel=2,
+    )
 
 try:
     import torch
@@ -106,12 +178,20 @@ def _resolve_cost_items(
                 resolved.append((fn, dict(kwargs or {})))
 
     if cost_config:
-        for key, kwargs in cost_config.items():
-            if key not in COST_MODELS:
-                raise KeyError(
-                    f"Unknown cost model key '{key}'. Available: {sorted(COST_MODELS.keys())}"
-                )
-            resolved.append((COST_MODELS[key], dict(kwargs or {})))
+        if not _HAS_COST_REGISTRY:
+            warnings.warn(
+                "A cost_config was provided but COST_MODELS registry is unavailable; "
+                "ignoring cost_config.",
+                stacklevel=2,
+            )
+        else:
+            for key, kwargs in cost_config.items():
+                if key not in COST_MODELS:
+                    raise KeyError(
+                        f"Unknown cost model key '{key}'. "
+                        f"Available: {sorted(COST_MODELS.keys())}"
+                    )
+                resolved.append((COST_MODELS[key], dict(kwargs or {})))
 
     return resolved
 

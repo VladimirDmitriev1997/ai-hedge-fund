@@ -24,8 +24,6 @@ Notes
     * Pandas DataFrame (`weights_to_holdings_df`) with MultiIndex support.
 """
 
-from __future__ import annotations
-
 from dataclasses import dataclass
 from typing import Any, Optional, Tuple, Union, Callable, Sequence, Mapping, Dict, List
 
@@ -33,12 +31,22 @@ import warnings
 import numpy as np
 import pandas as pd
 
-from hedge.fitting.torch_utils import (
-    _is_torch,
-    _as_array,
-    _zeros_like,
-    _sum,
-)
+# Prefer the canonical backend helpers from torch_utils under hedge.fitting,
+# but fall back to hedge.torch_utils for environments that re-export there.
+try:
+    from hedge.fitting.torch_utils import (
+        _is_torch,
+        _as_array,
+        _zeros_like,
+        _sum,
+    )
+except Exception:  # pragma: no cover
+    from hedge.fitting.torch_utils import (  # type: ignore
+        _is_torch,
+        _as_array,
+        _zeros_like,
+        _sum,
+    )
 
 try:
     import torch
