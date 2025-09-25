@@ -10,7 +10,7 @@ Design
     matrix `asset_returns` aligned by index (and by asset columns),
   * builds an objective from `loss_name|Objective`, `cost_config`, RF conventions,
   * runs optimization according to `mode={"grid","random","gradient"}`,
-  * returns a `FitResult` with best params, best loss, best weights, and history.
+  * returns a `FitResult` with best params, best weights, and history.
 
 Conventions
 -----------
@@ -32,7 +32,6 @@ Notes
 """
 
 from __future__ import annotations
-
 from dataclasses import dataclass, field
 from typing import (
     Any,
@@ -45,7 +44,11 @@ from typing import (
     Tuple,
     Union,
     Callable,
+    TYPE_CHECKING,
 )
+
+if TYPE_CHECKING:
+    import torch
 import itertools
 import math
 import random
@@ -56,7 +59,7 @@ import pandas as pd
 from hedge.fitting.losses import Objective, evaluate_objective
 from hedge.portfolio import CASH_COL  # unified CASH column name
 
-# Optional torch
+
 try:
     import torch
     from torch import Tensor as TorchTensor
@@ -251,6 +254,45 @@ def _ensure_returns(returns: Union[pd.DataFrame, np.ndarray]) -> np.ndarray:
     return arr
 
 
+def _infer_bars_per_unit(idx: pd.DatetimeIndex) -> float:
+    """Infer bars-per-unit (≈ per year) from median spacing if cfg value is <= 0."""
+    if not isinstance(idx, pd.DatetimeIndex) or len(idx) < 2:
+        return 252.0
+    deltas = idx.to_series().diff().dropna().dt.total_seconds()
+    if len(deltas) == 0:
+        return 252.0
+    med = float(deltas.median())
+    if med <= 0:
+        return 252.0
+    sec_per_year = 365.0 * 24.0 * 3600.0
+    return sec_per_year / med
+
+
+def _extract_rf_from_df(
+    df: pd.DataFrame, fallback_per_bar: float
+) -> Union[float, np.ndarray]:
+    """
+    Try to find a per-bar RF series in df; otherwise return scalar fallback.
+
+    Supported columns:
+      - flat: 'rf', 'risk_free', 'cash_return'
+      - MultiIndex: ('CASH','return'), ('RF','per_bar')
+    """
+    # MultiIndex first
+    if isinstance(df.columns, pd.MultiIndex):
+        for cand in [("CASH", "return"), ("RF", "per_bar")]:
+            if cand in df.columns:
+                s = pd.to_numeric(df[cand], errors="coerce").fillna(0.0).to_numpy()
+                return s
+    else:
+        for name in ("rf", "risk_free", "cash_return"):
+            if name in df.columns:
+                s = pd.to_numeric(df[name], errors="coerce").fillna(0.0).to_numpy()
+                return s
+    # fallback scalar
+    return float(fallback_per_bar)
+
+
 def _objective_from_config(cfg: LearningConfig) -> Objective:
     """
     Build an Objective from a string or pass-through.
@@ -271,10 +313,10 @@ def _objective_from_config(cfg: LearningConfig) -> Objective:
         name = str(cfg.objective).lower()
         obj = Objective(name=name)
 
-    # For Sharpe: set annualizer = bars_per_unit (variance scaled correctly)
+    # Set annualizer for Sharpe; RF per-period will be set downstream
     if obj.name.lower() == "neg_sharpe":
+        # Allow dynamic inference when cfg.bars_per_unit <= 0 (handled in fit entry)
         obj.annualizer = float(cfg.bars_per_unit)
-        obj.rf_per_period = cfg.rf_per_bar()
     return obj
 
 
@@ -282,6 +324,7 @@ def _eval_loss_for_weights(
     W: Union[pd.DataFrame, np.ndarray],
     asset_returns: Union[pd.DataFrame, np.ndarray],
     cfg: LearningConfig,
+    rf_per_bar: Optional[Union[float, np.ndarray]] = None,
 ) -> float:
     """
     Evaluate objective value for provided weights.
@@ -294,6 +337,8 @@ def _eval_loss_for_weights(
         Per-asset returns (T, M or T, M-1).
     cfg : LearningConfig
         Learning configuration including costs and objective.
+    rf_per_bar : float or (T,), optional
+        If provided, overrides cfg.rf_per_bar() for this evaluation.
 
     Returns
     -------
@@ -303,12 +348,18 @@ def _eval_loss_for_weights(
     R = _ensure_returns(asset_returns)
     W_arr = W.to_numpy() if isinstance(W, pd.DataFrame) else np.asarray(W)
 
+    # RF override (vector or scalar)
+    rf_used = cfg.rf_per_bar() if rf_per_bar is None else rf_per_bar
+
     obj = _objective_from_config(cfg)
+    # For Sharpe, ensure the same rf_per_period is used (can be scalar or vector)
+    if obj.name.lower() == "neg_sharpe":
+        obj.rf_per_period = rf_used  # may be float or ndarray
 
     loss_val = evaluate_objective(
         weights=W_arr,
         asset_returns=R,
-        rf=cfg.rf_per_bar(),
+        rf=rf_used,
         has_cash_in_returns=cfg.has_cash_in_returns,
         cash_col_idx=cfg.cash_col_idx,
         cost_items=None,
@@ -418,7 +469,7 @@ def _iter_random(
         yield params
 
 
-def _torch_device(opt: OptimizationConfig) -> Optional[torch.device]:  # type: ignore[name-defined]
+def _torch_device(opt: OptimizationConfig) -> Optional[Any]:  # type: ignore[name-defined]
     """
     Resolve torch device for gradient mode.
 
@@ -434,6 +485,7 @@ def _torch_device(opt: OptimizationConfig) -> Optional[torch.device]:  # type: i
     """
     if not _HAS_TORCH:
         return None
+
     if opt.device is not None:
         return torch.device(opt.device)
     return torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
@@ -488,6 +540,12 @@ def fit_strategy(
         learning = LearningConfig()
     if optimization is None:
         optimization = OptimizationConfig()
+
+    # Optional: infer bars_per_unit from data spacing if cfg value is invalid/nonpositive
+    if getattr(learning, "bars_per_unit", 252.0) <= 0 and isinstance(
+        df.index, pd.DatetimeIndex
+    ):
+        learning.bars_per_unit = _infer_bars_per_unit(df.index)
 
     mode = str(optimization.mode).lower()
     if mode == "grid":
@@ -587,10 +645,13 @@ def _fit_grid(
     best_params: Dict[str, Any] = {}
     best_weights: Optional[pd.DataFrame] = None
 
+    # Prepare RF per bar (vector or scalar)
+    rf_used = _extract_rf_from_df(df, cfg.rf_per_bar())
+
     for params in _iter_grid(grid):
         _apply_params(strategy, params)
         W = _predict_weights_df(strategy, df)
-        loss_val = _eval_loss_for_weights(W, asset_returns, cfg)
+        loss_val = _eval_loss_for_weights(W, asset_returns, cfg, rf_per_bar=rf_used)
         history.append((dict(params), loss_val))
         if loss_val < best_loss:
             best_loss = loss_val
@@ -600,7 +661,7 @@ def _fit_grid(
     # If empty grid, evaluate once with current params
     if not grid:
         W = _predict_weights_df(strategy, df)
-        loss_val = _eval_loss_for_weights(W, asset_returns, cfg)
+        loss_val = _eval_loss_for_weights(W, asset_returns, cfg, rf_per_bar=rf_used)
         history.append((dict(), loss_val))
         best_loss = loss_val
         best_params = {}
@@ -635,10 +696,12 @@ def _fit_random(
     best_params: Dict[str, Any] = {}
     best_weights: Optional[pd.DataFrame] = None
 
+    rf_used = _extract_rf_from_df(df, cfg.rf_per_bar())
+
     for params in _iter_random(dists, n_iter, opt.random_state):
         _apply_params(strategy, params)
         W = _predict_weights_df(strategy, df)
-        loss_val = _eval_loss_for_weights(W, asset_returns, cfg)
+        loss_val = _eval_loss_for_weights(W, asset_returns, cfg, rf_per_bar=rf_used)
         history.append((dict(params), loss_val))
         if loss_val < best_loss:
             best_loss = loss_val
@@ -648,7 +711,7 @@ def _fit_random(
     # Evaluate current strategy once if no distributions provided
     if not dists:
         W = _predict_weights_df(strategy, df)
-        loss_val = _eval_loss_for_weights(W, asset_returns, cfg)
+        loss_val = _eval_loss_for_weights(W, asset_returns, cfg, rf_per_bar=rf_used)
         history.append((dict(), loss_val))
         best_loss = loss_val
         best_params = {}
@@ -716,8 +779,17 @@ def _fit_gradient(
     R_np = _ensure_returns(asset_returns)
     R = torch.as_tensor(R_np, dtype=torch.float32, device=device)
 
-    # Build objective (Sharpe annualizer/rf set from cfg)
+    # RF per bar (vector or scalar), and Objective with annualizer set
+    rf_np = _extract_rf_from_df(df, cfg.rf_per_bar())
+    if isinstance(rf_np, np.ndarray):
+        rf_t = torch.as_tensor(rf_np, dtype=torch.float32, device=device)
+    else:
+        rf_t = torch.as_tensor(float(rf_np), dtype=torch.float32, device=device)
+
+    # If cfg.bars_per_unit <= 0, infer from df (already handled in fit_strategy)
     obj = _objective_from_config(cfg)
+    if obj.name.lower() == "neg_sharpe":
+        obj.rf_per_period = rf_t  # tensor ok; losses._as_array will handle
 
     # Choose optimizer
     opt_name = str(opt.optimizer).lower()
@@ -750,7 +822,7 @@ def _fit_gradient(
         loss_tensor = evaluate_objective(
             weights=W,
             asset_returns=R,
-            rf=cfg.rf_per_bar(),
+            rf=rf_t,
             has_cash_in_returns=cfg.has_cash_in_returns,
             cash_col_idx=cfg.cash_col_idx,
             cost_items=None,

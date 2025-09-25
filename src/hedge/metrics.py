@@ -1,629 +1,604 @@
+# metrics.py
 """
-Feature engineering utilities for time-series.
+Performance metrics for backtests and strategies.
 
-- All functions are vectorized and aligned to the input index.
-- Inputs are pandas Series (or multiple Series for OHLC features).
-- Missing values are handled deterministically via `min_periods`; early values are NaN.
-- By default, outputs are shifted by one bar (`causal=True`) to enforce causality:
-  features at index t use information available up to t-1.
+Design
+------
+- Vectorized, timestamp-aware where needed (CAGR, ROI_excess).
+- Minimal assumptions about brokerage/accounting.
+- Time scaling is made explicit:
+  * `elapsed_from_index(index, unit=...)` converts a series span into the
+    requested unit (years, months, weeks, days, hours, etc.).
+  * Where variance needs a scale factor, pass `bars_per_unit` (e.g., for 1-hour
+    bars with unit="years", `bars_per_unit = 8760`).
+
+Conventions
+-----------
+- `returns` are per-bar fractional returns (e.g., 0.002 = +0.2%). If you model
+  fees/slippage, pass *net* returns.
+- `equity` is the compounded account value series, typically produced by
+  `equity_curve(returns, init_equity=...)`.
+- Risk-free convention:
+    - Functions using `bars_per_unit` expect `rf` **per the same unit** and will
+      internally convert to per-bar via `rf / bars_per_unit` where applicable.
 """
 
-from typing import Literal, Tuple, Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from hedge.utils import ensure_series
 
+from hedge.utils import ensure_series, elapsed_from_index
+
+# Public API (exported names)
 __all__ = [
-    # sanity utilities
-    "ensure_series",
-    "lag",
-    # price transforms
-    "simple_returns",
-    "log_returns",
-    # averages / smoothing
-    "sma",
-    "ema",
-    "wma",
-    # volatility & dispersion
-    "rolling_vol",
-    "ewma_vol",
-    "zscore",
-    # momentum/oscillators
-    "rsi",
-    "macd",
-    # bands & ranges
-    "bollinger_bands",
-    "true_range",
-    "atr",
-    # rolling extrema / sums
-    "rolling_min",
-    "rolling_max",
-    "rolling_sum",
+    # equity & pnl
+    "equity_curve",
+    "pnl_from_equity",
+    "pnl_from_returns",
+    # returns-based & annualized metrics
+    "roi",
+    "roi_excess",
+    "cagr",
+    "excess_cagr",
+    "volatility",
+    "sharpe",
+    # path-dependent risk
+    "max_drawdown",
+    # calmar variants & wrapper
+    "calmar_nominal",
+    "calmar_excess",
+    "calmar_rf",
+    "calmar_real_from_cpi",
+    "calmar",
+    # other descriptive stats
+    "hit_rate",
+    "turnover",
 ]
 
 
 # ---------------------------------------------------------------------
-# Internal helpers
+# Equity & PnL
 # ---------------------------------------------------------------------
 
 
-def _causal_shift(x: pd.Series, causal: bool, k: int = 1) -> pd.Series:
+def equity_curve(returns: pd.Series, init_equity: float = 1.0) -> pd.Series:
     """
-    Apply a causal shift if requested.
+    Compound per-bar returns into an equity curve.
 
     Parameters
     ----------
-    x : pd.Series
-        Series to shift.
-    causal : bool
-        If True, shift by `k` bars.
-    k : int, default 1
-        Shift magnitude.
+    returns : pd.Series
+        Per-bar fractional returns (already net, if you modeled costs).
+    init_equity : float, default 1.0
+        Starting notional (account currency units).
 
     Returns
     -------
     pd.Series
-        Shifted or original series.
+        Compounded equity series named 'equity'. Same index as `returns`.
     """
-    return x.shift(k) if causal else x
+    r = ensure_series(returns, "returns").fillna(0.0)
+    e = (1.0 + r).cumprod() * float(init_equity)
+    return e.rename("equity")
 
 
-# ---------------------------------------------------------------------
-# Helpers
-# ---------------------------------------------------------------------
-
-
-def lag(x: pd.Series, k: int = 1) -> pd.Series:
+def pnl_from_equity(equity: pd.Series) -> pd.Series:
     """
-    Shift the series by k periods into the past.
+    Per-bar PnL as the first difference of the equity curve.
 
     Parameters
     ----------
-    x : pd.Series
-        Input series.
-    k : int, default 1
-        Positive values shift *down* (past values appear later).
+    equity : pd.Series
+        Equity series in currency units.
 
     Returns
     -------
     pd.Series
-        Shifted series with NaNs introduced at the start.
+        Per-bar PnL in currency units, aligned to `equity`, name 'pnl'.
     """
-    return ensure_series(x).shift(k)
+    e = ensure_series(equity, "equity")
+    return e.diff().fillna(0.0).rename("pnl")
 
 
-# ---------------------------------------------------------------------
-# Price transforms
-# ---------------------------------------------------------------------
-
-
-def simple_returns(close: pd.Series, *, causal: bool = True) -> pd.Series:
-    """
-    Compute simple returns r_t = (C_t / C_{t-1}) - 1.
-
-    Parameters
-    ----------
-    close : pd.Series
-        Close prices.
-    causal : bool, default True
-        If True, shift the result by 1 to enforce causality.
-
-    Returns
-    -------
-    pd.Series
-        Simple returns, NaN at the first observation (and shifted if causal).
-    """
-    c = ensure_series(close, "close")
-    r = c.pct_change()
-    return _causal_shift(r, causal)
-
-
-def log_returns(close: pd.Series, *, causal: bool = True) -> pd.Series:
-    """
-    Compute log returns ln(C_t) - ln(C_{t-1}), with protection against non-positive prices.
-
-    Parameters
-    ----------
-    close : pd.Series
-        Close prices.
-    causal : bool, default True
-        If True, shift the result by 1 to enforce causality.
-
-    Returns
-    -------
-    pd.Series
-        Log returns, NaN at the first observation (and wherever prices are non-positive).
-    """
-    c = ensure_series(close, "close").astype(float)
-    # Guard: non-positive prices → NaN
-    c = c.where(c > 0.0, np.nan)
-    lr = np.log(c).diff()
-    return _causal_shift(lr, causal)
-
-
-# ---------------------------------------------------------------------
-# Averages / smoothing
-# ---------------------------------------------------------------------
-
-
-def sma(x: pd.Series, window: int, *, causal: bool = True) -> pd.Series:
-    """
-    Simple Moving Average (SMA).
-
-    Parameters
-    ----------
-    x : pd.Series
-        Input series (e.g., close).
-    window : int
-        Window length (bars). Must be >= 1.
-    causal : bool, default True
-        If True, shift the result by 1 to enforce causality.
-
-    Returns
-    -------
-    pd.Series
-        SMA with NaNs for the first (window-1) bars (and shifted if causal).
-    """
-    if window < 1:
-        raise ValueError("window must be >= 1")
-    s = ensure_series(x)
-    out = s.rolling(window=window, min_periods=window).mean()
-    return _causal_shift(out, causal)
-
-
-def ema(x: pd.Series, span: int, *, causal: bool = True) -> pd.Series:
-    """
-    Exponential Moving Average (EMA) with span parameter.
-
-    Parameters
-    ----------
-    x : pd.Series
-        Input series.
-    span : int
-        EMA span (bars). Must be >= 1.
-    causal : bool, default True
-        If True, shift the result by 1 to enforce causality.
-
-    Returns
-    -------
-    pd.Series
-        EMA with NaNs until enough history accumulates (shifted if causal).
-    """
-    if span < 1:
-        raise ValueError("span must be >= 1")
-    s = ensure_series(x)
-    out = s.ewm(span=span, adjust=False, min_periods=span).mean()
-    return _causal_shift(out, causal)
-
-
-def wma(x: pd.Series, window: int, *, causal: bool = True) -> pd.Series:
-    """
-    Weighted Moving Average (linearly weighted over the window).
-
-    Parameters
-    ----------
-    x : pd.Series
-        Input series.
-    window : int
-        Window length (bars). Must be >= 1.
-    causal : bool, default True
-        If True, shift the result by 1 to enforce causality.
-
-    Returns
-    -------
-    pd.Series
-        WMA with NaNs for the initial (window-1) bars (shifted if causal).
-    """
-    if window < 1:
-        raise ValueError("window must be >= 1")
-    s = ensure_series(x)
-    w = np.arange(1, window + 1, dtype=float)
-    out = s.rolling(window, min_periods=window).apply(
-        lambda a: np.dot(a, w) / w.sum(), raw=True
-    )
-    return _causal_shift(out, causal)
-
-
-# ---------------------------------------------------------------------
-# Volatility & dispersion
-# ---------------------------------------------------------------------
-
-
-def rolling_vol(
-    x: pd.Series, window: int, ddof: int = 0, *, causal: bool = True
+def pnl_from_returns(
+    returns: pd.Series,
+    init_equity: float = 1.0,
+    reinvest: bool = True,
+    fixed_notional: Optional[float] = None,
 ) -> pd.Series:
     """
-    Rolling standard deviation (volatility proxy).
+    Compute per-bar PnL directly from returns.
 
-    Parameters
-    ----------
-    x : pd.Series
-        Input series (e.g., returns).
-    window : int
-        Window length.
-    ddof : int, default 0
-        Delta degrees of freedom (0 for population-like std).
-    causal : bool, default True
-        If True, shift the result by 1 to enforce causality.
-
-    Returns
-    -------
-    pd.Series
-        Rolling std with NaNs for the warm-up window (shifted if causal).
-    """
-    if window < 1:
-        raise ValueError("window must be >= 1")
-    s = ensure_series(x)
-    out = s.rolling(window=window, min_periods=window).std(ddof=ddof)
-    return _causal_shift(out, causal)
-
-
-def ewma_vol(
-    x: pd.Series, span: int, ddof: int = 0, *, causal: bool = True
-) -> pd.Series:
-    """
-    EWMA volatility proxy via exponentially weighted variance.
-
-    Parameters
-    ----------
-    x : pd.Series
-        Input series (e.g., returns).
-    span : int
-        EWMA span (bars). Must be >= 1.
-    ddof : int, default 0
-        Degrees of freedom for std (kept for API symmetry).
-    causal : bool, default True
-        If True, shift the result by 1 to enforce causality.
-
-    Returns
-    -------
-    pd.Series
-        EW std with NaNs until enough history accumulates (shifted if causal).
-
-    Notes
+    Modes
     -----
-    Uses the moment trick because older pandas may not support `ewm.std` with min_periods.
-    """
-    if span < 1:
-        raise ValueError("span must be >= 1")
-    s = ensure_series(x)
-    m = s.ewm(span=span, adjust=False, min_periods=span).mean()
-    v = (s - m).pow(2).ewm(span=span, adjust=False, min_periods=span).mean()
-    out = np.sqrt(v)
-    return _causal_shift(out, causal)
-
-
-def zscore(x: pd.Series, window: int, *, causal: bool = True) -> pd.Series:
-    """
-    Rolling z-score: (x - rolling_mean) / rolling_std.
+    reinvest=True (default)
+        Compounding mode. Traded notional each bar equals prior equity:
+        `PnL_t = E_{t-1} * r_t`.
+    reinvest=False and `fixed_notional` provided
+        Non-compounding mode: `PnL_t = fixed_notional * r_t`.
 
     Parameters
     ----------
-    x : pd.Series
-        Input series.
-    window : int
-        Window length.
-    causal : bool, default True
-        If True, shift the result by 1 to enforce causality.
+    returns : pd.Series
+        Per-bar fractional returns.
+    init_equity : float, default 1.0
+        Initial equity used in compounding mode.
+    reinvest : bool, default True
+        Whether to compound the notional.
+    fixed_notional : float or None
+        Required when `reinvest=False`; constant traded notional per bar.
 
     Returns
     -------
     pd.Series
-        Z-score with NaNs during warm-up or where std=0 (shifted if causal).
+        Per-bar PnL in currency units, name 'pnl'.
     """
-    if window < 1:
-        raise ValueError("window must be >= 1")
-    s = ensure_series(x)
-    m = sma(s, window, causal=False)  # avoid double shift
-    sd = s.rolling(window, min_periods=window).std(ddof=0)
-    out = (s - m) / sd
-    out = out.replace([np.inf, -np.inf], np.nan)
-    return _causal_shift(out, causal)
+    r = ensure_series(returns, "returns").fillna(0.0)
 
-
-# ---------------------------------------------------------------------
-# Momentum / oscillators
-# ---------------------------------------------------------------------
-
-
-def rsi(close: pd.Series, window: int = 14, *, causal: bool = True) -> pd.Series:
-    """
-    Relative Strength Index (Wilder's).
-
-    Parameters
-    ----------
-    close : pd.Series
-        Close prices.
-    window : int, default 14
-        Lookback for average gains/losses.
-    causal : bool, default True
-        If True, shift the result by 1 to enforce causality.
-
-    Returns
-    -------
-    pd.Series
-        RSI in [0, 100] with NaNs during warm-up (shifted if causal).
-    """
-    if window < 1:
-        raise ValueError("window must be >= 1")
-    c = ensure_series(close, "close").astype(float)
-    delta = c.diff()
-
-    gain = delta.clip(lower=0.0)
-    loss = -delta.clip(upper=0.0)
-
-    # Wilder's smoothing via EWMs with alpha = 1/window
-    avg_gain = gain.ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean()
-    avg_loss = loss.ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean()
-
-    rs = avg_gain / avg_loss
-    rsi_val = 100.0 - (100.0 / (1.0 + rs))
-    rsi_val = rsi_val.replace([np.inf, -np.inf], np.nan)
-    return _causal_shift(rsi_val, causal)
-
-
-def macd(
-    close: pd.Series,
-    fast_span: int = 12,
-    slow_span: int = 26,
-    signal_span: int = 9,
-    ppo: bool = False,
-    *,
-    causal: bool = True,
-) -> pd.DataFrame:
-    """
-    Moving Average Convergence/Divergence (MACD) or PPO.
-
-    Parameters
-    ----------
-    close : pd.Series
-        Close prices.
-    fast_span : int, default 12
-        Fast EMA span (must be < slow_span).
-    slow_span : int, default 26
-        Slow EMA span.
-    signal_span : int, default 9
-        EMA span for the signal line.
-    ppo : bool, default False
-        If True, use PPO core = (EMA_fast - EMA_slow) / EMA_slow (scale-invariant).
-    causal : bool, default True
-        If True, shift all outputs by 1 to enforce causality.
-
-    Returns
-    -------
-    pd.DataFrame
-        Columns:
-        - macd/ppo : core line (MACD or PPO)
-        - signal   : EMA(core, signal_span)
-        - hist     : core - signal
-        All columns are shifted if `causal=True`.
-
-    Notes
-    -----
-    Validates `fast_span < slow_span`. Protects division by zero in PPO mode.
-    """
-    if not (fast_span >= 1 and slow_span >= 1 and signal_span >= 1):
-        raise ValueError("all spans must be >= 1")
-    if not (fast_span < slow_span):
-        raise ValueError("fast_span must be < slow_span")
-
-    c = ensure_series(close, "close")
-    ema_fast = ema(c, fast_span, causal=False)
-    ema_slow = ema(c, slow_span, causal=False)
-
-    diff = ema_fast - ema_slow
-    if ppo:
-        denom = ema_slow.replace(0.0, np.nan)
-        core = diff / denom
-        core_name = "ppo"
+    if reinvest:
+        e = equity_curve(r, init_equity=float(init_equity))
+        pnl = e.diff().fillna(e.iloc[0] - float(init_equity))
+        return pnl.rename("pnl")
     else:
-        core = diff
-        core_name = "macd"
-
-    signal_line = core.ewm(
-        span=signal_span, adjust=False, min_periods=signal_span
-    ).mean()
-    hist = core - signal_line
-
-    out = pd.DataFrame({core_name: core, "signal": signal_line, "hist": hist})
-    return out.shift(1) if causal else out
+        if fixed_notional is None:
+            raise ValueError("Provide fixed_notional when reinvest=False.")
+        return (r * float(fixed_notional)).rename("pnl")
 
 
 # ---------------------------------------------------------------------
-# Bands & ranges
+# Nominal & excess return metrics
 # ---------------------------------------------------------------------
 
 
-def bollinger_bands(
-    close: pd.Series,
-    window: int = 20,
-    num_std: float = 2.0,
-    *,
-    causal: bool = True,
-) -> pd.DataFrame:
+def roi(equity: pd.Series) -> float:
     """
-    Bollinger Bands: middle SMA ± num_std * rolling std.
+    Total (nominal) return over the evaluation window.
+
+    Definition
+    ----------
+    ROI = E_T / E_0 − 1
 
     Parameters
     ----------
-    close : pd.Series
-        Close prices.
-    window : int, default 20
-        SMA/std window.
-    num_std : float, default 2.0
-        Multiplier for the standard deviation.
-    causal : bool, default True
-        If True, shift all outputs by 1 to enforce causality.
+    equity : pd.Series
+        Equity curve.
 
     Returns
     -------
-    pd.DataFrame
-        Columns: mid (SMA), upper, lower, bandwidth, percent_b.
-        All columns are shifted if `causal=True`.
+    float
+        Total nominal return. NaN if series is too short.
     """
-    if window < 1:
-        raise ValueError("window must be >= 1")
-    c = ensure_series(close, "close")
-    mid = sma(c, window, causal=False)
-    sd = c.rolling(window, min_periods=window).std(ddof=0)
-    upper = mid + num_std * sd
-    lower = mid - num_std * sd
-    denom = (upper - lower).replace(0.0, np.nan)
-    bandwidth = (upper - lower) / mid.replace(0.0, np.nan)
-    percent_b = (c - lower) / denom
-
-    out = pd.DataFrame(
-        {
-            "mid": mid,
-            "upper": upper,
-            "lower": lower,
-            "bandwidth": bandwidth,
-            "percent_b": percent_b,
-        }
-    )
-    return out.shift(1) if causal else out
+    e = ensure_series(equity, "equity")
+    if len(e) < 2:
+        return float("nan")
+    return float(e.iloc[-1] / e.iloc[0] - 1.0)
 
 
-def true_range(
-    high: pd.Series, low: pd.Series, close: pd.Series, *, causal: bool = True
-) -> pd.Series:
+def roi_excess(equity: pd.Series, rf: float, time_unit: str) -> float:
     """
-    True Range (TR) per bar.
+    Excess total return over a constant per-`time_unit` risk-free rate.
+
+    Definition
+    ----------
+    Let `T = elapsed_from_index(e.index, unit=time_unit)`.
+    `ROI_excess = (E_T/E_0) / (1 + rf)^T − 1`.
 
     Parameters
     ----------
-    high, low, close : pd.Series
-        OHLC series (same index).
-    causal : bool, default True
-        If True, shift the result by 1 to enforce causality.
+    equity : pd.Series
+        Equity curve.
+    rf : float
+        Risk-free rate per `time_unit` (e.g., annual rf if time_unit="years").
+    time_unit : str
+        Unit used to measure elapsed time (e.g., "years", "months", "days", ...).
 
     Returns
     -------
-    pd.Series
-        True range: max(high - low, |high - prev_close|, |low - prev_close|) (shifted if causal).
-
-    Notes
-    -----
-    Uses `prev_close = close.shift(1)` to form the classic TR definition.
+    float
+        Excess total return versus the rf benchmark. NaN if series too short.
     """
-    h = ensure_series(high, "high")
-    l = ensure_series(low, "low")
-    c = ensure_series(close, "close")
-    prev_close = c.shift(1)
-    tr = pd.concat(
-        [(h - l).abs(), (h - prev_close).abs(), (l - prev_close).abs()], axis=1
-    ).max(axis=1)
-    return _causal_shift(tr, causal)
+    e = ensure_series(equity, "equity")
+    if len(e) < 2:
+        return float("nan")
+    T = elapsed_from_index(e.index, unit=time_unit)
+    if T <= 0:
+        return float("nan")
+    gross = float(e.iloc[-1] / e.iloc[0])
+    bench = (1.0 + float(rf)) ** T
+    return float(gross / bench - 1.0)
 
 
-def atr(
-    high: pd.Series,
-    low: pd.Series,
-    close: pd.Series,
-    window: int = 14,
-    *,
-    causal: bool = True,
-) -> pd.Series:
+def cagr(equity: pd.Series, time_unit: str) -> float:
     """
-    Average True Range (ATR) via Wilder's smoothing.
+    Compound growth rate per `time_unit`, computed from timestamps.
+
+    Definition
+    ----------
+    Let `T = elapsed_from_index(e.index, unit=time_unit)`.
+    `CAGR = (E_T/E_0)^(1/T) − 1`.
 
     Parameters
     ----------
-    high, low, close : pd.Series
-        OHLC series.
-    window : int, default 14
-        Lookback for ATR.
-    causal : bool, default True
-        If True, shift the result by 1 to enforce causality.
+    equity : pd.Series
+        Equity curve.
+    time_unit : str
+        Unit used to measure elapsed time (e.g., "years", "months", "days", ...).
 
     Returns
     -------
-    pd.Series
-        ATR series (same units as price), shifted if causal.
+    float
+        Geometric growth rate per `time_unit`. NaN if series too short.
     """
-    if window < 1:
-        raise ValueError("window must be >= 1")
-    tr = true_range(high, low, close, causal=False)
-    out = tr.ewm(alpha=1.0 / window, adjust=False, min_periods=window).mean()
-    return _causal_shift(out, causal)
+    e = ensure_series(equity, "equity")
+    if len(e) < 2:
+        return float("nan")
+    T = elapsed_from_index(e.index, unit=time_unit)
+    if T <= 0:
+        return float("nan")
+    return float((e.iloc[-1] / e.iloc[0]) ** (1.0 / T) - 1.0)
+
+
+def excess_cagr(equity: pd.Series, rf_annual: float, time_unit: str) -> float:
+    """
+    Geometric excess growth rate per `time_unit` over a constant rf.
+
+    Definition
+    ----------
+    `g_excess = (1 + g_nominal) / (1 + rf) − 1`, where
+    `g_nominal = CAGR(equity, time_unit)`.
+
+    Parameters
+    ----------
+    equity : pd.Series
+        Equity curve.
+    rf_annual : float
+        Risk-free rate per the same `time_unit` you use for `cagr` (name kept
+        for backward-compatibility).
+    time_unit : str
+        Unit used to compute the growth rate.
+
+    Returns
+    -------
+    float
+        Excess geometric growth rate. NaN if series too short.
+    """
+    g_nom = cagr(equity, time_unit=time_unit)
+    return float((1.0 + g_nom) / (1.0 + float(rf_annual)) - 1.0)
+
+
+def volatility(
+    returns: pd.Series,
+    bars_per_unit: float,
+    use_excess: bool = False,
+    rf: float = 0.0,
+    ddof: int = 0,
+) -> float:
+    """
+    Scaled standard deviation of returns (per chosen unit).
+
+    Parameters
+    ----------
+    returns : pd.Series
+        Per-bar returns (net if costs modeled).
+    bars_per_unit : float
+        Number of bars in the chosen unit (e.g., 8760 for 1h bars → years).
+    use_excess : bool, default False
+        If True, subtract per-bar risk-free (rf / bars_per_unit) before std.
+    rf : float, default 0.0
+        Risk-free rate per the same unit used for scaling (e.g., annual rf for years).
+    ddof : int, default 0
+        Degrees of freedom for std (0 = population style).
+
+    Returns
+    -------
+    float
+        Volatility scaled by sqrt(bars_per_unit). NaN if not enough data.
+    """
+    r = ensure_series(returns, "returns").dropna()
+    if len(r) < 2:
+        return float("nan")
+    if use_excess and rf != 0.0:
+        r = r - (float(rf) / float(bars_per_unit))
+    return float(r.std(ddof=ddof) * np.sqrt(float(bars_per_unit)))
+
+
+def sharpe(
+    returns: pd.Series,
+    bars_per_unit: float,
+    rf: float = 0.0,
+    ddof: int = 0,
+) -> float:
+    """
+    Sharpe ratio: mean excess return over volatility (per chosen unit).
+
+    Definition
+    ----------
+    Per-bar excess `x_t = r_t − rf / bars_per_unit`.
+    `Sharpe ≈ mean(x) / std(x) * sqrt(bars_per_unit)`.
+
+    Parameters
+    ----------
+    returns : pd.Series
+        Per-bar returns (net if costs modeled).
+    bars_per_unit : float
+        Number of bars in the chosen unit (e.g., 8760 for 1h bars → years).
+    rf : float, default 0.0
+        Risk-free rate per the same unit used for scaling (e.g., annual rf for years).
+    ddof : int, default 0
+        Degrees of freedom for std.
+
+    Returns
+    -------
+    float
+        Sharpe ratio. NaN if variance is zero or series too short.
+    """
+    r = ensure_series(returns, "returns").dropna()
+    if len(r) < 2:
+        return float("nan")
+    x = r - (float(rf) / float(bars_per_unit))
+    denom = x.std(ddof=ddof)
+    if denom == 0 or np.isnan(denom):
+        return float("nan")
+    return float(x.mean() / denom * np.sqrt(float(bars_per_unit)))
 
 
 # ---------------------------------------------------------------------
-# Rolling extrema / sums
+# Path-dependent risk
 # ---------------------------------------------------------------------
 
 
-def rolling_min(x: pd.Series, window: int, *, causal: bool = True) -> pd.Series:
+def max_drawdown(equity: pd.Series) -> Tuple[float, pd.Timestamp, pd.Timestamp]:
     """
-    Rolling minimum.
+    Maximum drawdown (MDD) of the equity curve.
 
     Parameters
     ----------
-    x : pd.Series
-        Input series.
-    window : int
-        Window length.
-    causal : bool, default True
-        If True, shift the result by 1 to enforce causality.
+    equity : pd.Series
+        Equity curve.
 
     Returns
     -------
-    pd.Series
-        Min over the window with NaNs during warm-up (shifted if causal).
+    tuple
+        `(mdd, peak_ts, trough_ts)` where
+        - `mdd` is a non-positive float,
+        - `peak_ts` is the timestamp of the prior peak,
+        - `trough_ts` is the timestamp of the worst trough.
+        Returns `(NaN, NaT, NaT)` if input is empty.
     """
-    if window < 1:
-        raise ValueError("window must be >= 1")
-    s = ensure_series(x)
-    out = s.rolling(window=window, min_periods=window).min()
-    return _causal_shift(out, causal)
+    e = ensure_series(equity, "equity")
+    if len(e) == 0:
+        return float("nan"), pd.NaT, pd.NaT
+    runup = e.cummax()
+    dd = e / runup - 1.0
+    trough = dd.idxmin()
+    if trough is pd.NaT:
+        return float(0.0), pd.NaT, pd.NaT
+    peak = runup.loc[:trough].idxmax()
+    return float(dd.min()), peak, trough
 
 
-def rolling_max(x: pd.Series, window: int, *, causal: bool = True) -> pd.Series:
+# ---------------------------------------------------------------------
+# Calmar variants (nominal / excess / rf) and wrapper
+# ---------------------------------------------------------------------
+
+
+def calmar_nominal(equity: pd.Series, time_unit: str = "years") -> float:
     """
-    Rolling maximum.
+    Nominal Calmar ratio.
+
+    Definition
+    ----------
+    `Calmar = CAGR(equity, time_unit) / |MDD(equity)|`.
 
     Parameters
     ----------
-    x : pd.Series
-        Input series.
-    window : int
-        Window length.
-    causal : bool, default True
-        If True, shift the result by 1 to enforce causality.
+    equity : pd.Series
+        Equity curve.
+    time_unit : str, default "years"
+        Unit used for CAGR.
 
     Returns
     -------
-    pd.Series
-        Max over the window with NaNs during warm-up (shifted if causal).
+    float
+        Nominal Calmar ratio. Returns +inf if MDD is zero; NaN if data is insufficient.
     """
-    if window < 1:
-        raise ValueError("window must be >= 1")
-    s = ensure_series(x)
-    out = s.rolling(window=window, min_periods=window).max()
-    return _causal_shift(out, causal)
+    g = cagr(equity, time_unit=time_unit)
+    mdd, *_ = max_drawdown(equity)
+    if np.isnan(mdd):
+        return float("nan")
+    return float(np.inf) if mdd == 0 else float(g / abs(mdd))
 
 
-def rolling_sum(x: pd.Series, window: int, *, causal: bool = True) -> pd.Series:
+def calmar_excess(equity: pd.Series, rf: float, time_unit: str) -> float:
     """
-    Rolling sum.
+    Excess Calmar ratio (geometric excess growth in the numerator).
+
+    Definition
+    ----------
+    `Calmar_excess = ExcessCAGR(equity, rf, time_unit) / |MDD(equity)|`.
 
     Parameters
     ----------
-    x : pd.Series
-        Input series.
-    window : int
-        Window length.
-    causal : bool, default True
-        If True, shift the result by 1 to enforce causality.
+    equity : pd.Series
+        Equity curve.
+    rf : float
+        Risk-free rate per `time_unit`.
+    time_unit : str
+        Unit used to compute the growth rate.
 
     Returns
     -------
-    pd.Series
-        Sum over the window with NaNs during warm-up (shifted if causal).
+    float
+        Excess Calmar ratio. Returns +inf if MDD is zero; NaN if data is insufficient.
     """
-    if window < 1:
-        raise ValueError("window must be >= 1")
-    s = ensure_series(x)
-    out = s.rolling(window=window, min_periods=window).sum()
-    return _causal_shift(out, causal)
+    g_ex = excess_cagr(equity, rf_annual=float(rf), time_unit=time_unit)
+    mdd, *_ = max_drawdown(equity)
+    if np.isnan(mdd):
+        return float("nan")
+    return float(np.inf) if mdd == 0 else float(g_ex / abs(mdd))
+
+
+def calmar_rf(equity: pd.Series, rf: float = 0.0, time_unit: str = "years") -> float:
+    """
+    Calmar ratio with simple rf subtraction in the numerator.
+
+    Definition
+    ----------
+    `Calmar_rf = (CAGR(equity, time_unit) − rf) / |MDD(equity)|`.
+
+    Parameters
+    ----------
+    equity : pd.Series
+        Equity curve.
+    rf : float, default 0.0
+        Risk-free rate per `time_unit` to subtract from the CAGR.
+    time_unit : str, default "years"
+        Unit used to compute CAGR.
+
+    Returns
+    -------
+    float
+        Calmar with rf subtraction. Returns +inf if MDD is zero; NaN if data is insufficient.
+    """
+    e = ensure_series(equity, "equity")
+    if len(e) < 2:
+        return float("nan")
+
+    r_p = cagr(e, time_unit=time_unit)
+    numerator = r_p - float(rf)
+
+    mdd, *_ = max_drawdown(e)
+    if np.isnan(mdd):
+        return float("nan")
+    return float(np.inf) if mdd == 0 else float(numerator / abs(mdd))
+
+
+def calmar_real_from_cpi(
+    equity: pd.Series,
+    cpi: pd.Series,
+    mode: str = "nominal",
+    rf: float = 0.0,
+    time_unit: str = "years",
+) -> float:
+    """
+    Calmar ratio computed on **real** (inflation-adjusted) equity.
+
+    Procedure
+    ---------
+    - Deflate equity by CPI index normalized to its first value:
+        `equity_real = equity / (cpi / cpi.iloc[0])`.
+    - Compute `calmar(equity_real, mode=..., rf=..., time_unit=...)`.
+
+    Parameters
+    ----------
+    equity : pd.Series
+        Nominal equity curve.
+    cpi : pd.Series
+        CPI index level (same index frequency; will be aligned and forward-filled).
+    mode : {'nominal','excess','rf'}, default 'nominal'
+        Calmar variant to compute on real equity.
+    rf : float, default 0.0
+        Risk-free rate per `time_unit` (used in 'excess' and 'rf' modes).
+    time_unit : str, default "years"
+        Unit used for growth metrics.
+
+    Returns
+    -------
+    float
+        Calmar ratio on real equity, following the chosen mode.
+    """
+    e = ensure_series(equity, "equity").copy()
+    z = ensure_series(cpi, "cpi").reindex(e.index).ffill()
+    if len(e) < 2 or len(z) < 2 or z.iloc[0] == 0 or np.isnan(z.iloc[0]):
+        return float("nan")
+    z_norm = z / z.iloc[0]
+    e_real = (e / z_norm).rename("equity_real")
+    return calmar(e_real, mode=mode, rf=rf, time_unit=time_unit)
+
+
+def calmar(
+    equity: pd.Series,
+    mode: str = "nominal",
+    rf: float = 0.0,
+    time_unit: str = "years",
+) -> float:
+    """
+    Unified Calmar interface.
+
+    Parameters
+    ----------
+    equity : pd.Series
+        Equity curve.
+    mode : {'nominal','excess','rf'}, default 'nominal'
+        - 'nominal' : `CAGR/|MDD|`.
+        - 'excess'  : `ExcessCAGR(rf, time_unit)/|MDD|` (geometric excess).
+        - 'rf'      : `(CAGR − rf)/|MDD|` (simple difference).
+    rf : float, default 0.0
+        Risk-free rate per `time_unit` (used in 'excess' and 'rf' modes).
+    time_unit : str, default "years"
+        Unit used for growth metrics (e.g., "years", "months", "days").
+
+    Returns
+    -------
+    float
+        The chosen Calmar ratio.
+
+    Raises
+    ------
+    ValueError
+        If `mode` is unknown.
+    """
+    mode = str(mode).lower()
+    if mode == "nominal":
+        return calmar_nominal(equity, time_unit=time_unit)
+    elif mode == "excess":
+        return calmar_excess(equity, rf=float(rf), time_unit=time_unit)
+    elif mode == "rf":
+        return calmar_rf(equity, rf=float(rf), time_unit=time_unit)
+    else:
+        raise ValueError("mode must be one of {'nominal','excess','rf'}")
+
+
+# ---------------------------------------------------------------------
+# Other descriptive stats
+# ---------------------------------------------------------------------
+
+
+def hit_rate(returns: pd.Series) -> float:
+    """
+    Fraction of bars with strictly positive return.
+
+    Parameters
+    ----------
+    returns : pd.Series
+        Per-bar returns.
+
+    Returns
+    -------
+    float
+        Share in [0, 1] of bars with `returns > 0`. NaN if no valid data.
+    """
+    r = ensure_series(returns, "returns").dropna()
+    if len(r) == 0:
+        return float("nan")
+    return float((r > 0).mean())
+
+
+def turnover(positions: pd.Series) -> float:
+    """
+    Sum of absolute position changes per bar (trading intensity proxy).
+
+    Parameters
+    ----------
+    positions : pd.Series
+        Position series (e.g., -1/0/+1 or continuous sizing). NaNs are treated as 0.
+
+    Returns
+    -------
+    float
+        Sum over time of |pos_t − pos_{t-1}|. To scale to a unit (e.g., yearly),
+        convert externally using elapsed time or bar counts.
+    """
+    p = ensure_series(positions, "position").fillna(0.0)
+    return float(p.diff().abs().fillna(0.0).sum())

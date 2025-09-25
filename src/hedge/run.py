@@ -26,28 +26,32 @@ Notes
   index, it is used in holdings conversion and Sharpe (see metrics).
 """
 
+from __future__ import annotations
 
 from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any, Dict, Mapping, Optional, Sequence, Tuple, Union, List
 import json
-import math
-import time
 from datetime import datetime, timezone
 
 import numpy as np
 import pandas as pd
 
 # Project imports
-from hedge.data import DataScheme, load_ohlcv_csv, load_portfolio_csv
+# make load_portfolio_csv optional to avoid hard dependency if not exported
+try:
+    from hedge.data import DataScheme, load_ohlcv_csv, load_portfolio_csv  # type: ignore
+except Exception:  # pragma: no cover
+    from hedge.data import DataScheme, load_ohlcv_csv  # type: ignore
 
+    load_portfolio_csv = None  # type: ignore[assignment]
 
 from hedge.strategies import (
     BaseStrategy,
     SingleAssetMACrossover,
     StrategyResult,
 )
-from hedge.learning import (
+from hedge.fitting.learning import (
     LearningConfig,
     OptimizationConfig,
     FitResult as FitResultLearning,
@@ -160,7 +164,7 @@ def load_model(path: Union[str, Path]) -> BaseStrategy:
     cls_name = payload["strategy_class"]
     module_name = payload["strategy_module"]
     # Try registry first
-    for k, cls in STRATEGY_REGISTRY.items():
+    for _, cls in STRATEGY_REGISTRY.items():
         if cls.__name__ == cls_name:
             return cls.from_dict(payload["strategy_config"])
     # Fallback: dynamic import
@@ -174,11 +178,71 @@ def load_model(path: Union[str, Path]) -> BaseStrategy:
 # ---------------------------------------------------------------------
 
 
+def _generic_load_portfolio_csv(path: Union[str, Path]) -> pd.DataFrame:
+    """
+    Robustly load a 'portfolio_<code>.csv' saved with MultiIndex columns
+    (two header rows) OR a flat form like 'BTCUSDT.close'.
+
+    Returns a DataFrame with:
+      - tz-aware UTC DatetimeIndex named 'timestamp'
+      - columns either MultiIndex (symbol, field) or flat per-asset
+    """
+    p = Path(path)
+    # First try two-row header (what pandas writes for MultiIndex columns)
+    try:
+        df = pd.read_csv(p, header=[0, 1])
+        if isinstance(df.columns, pd.MultiIndex):
+            # find the timestamp column at level 0
+            ts_candidates = [
+                c for c in df.columns if isinstance(c, tuple) and c[0] == "timestamp"
+            ]
+            if ts_candidates:
+                ts_col = ts_candidates[0]
+                ts = pd.to_datetime(df[ts_col], utc=True, errors="coerce")
+                if ts.isna().any():
+                    raise ValueError("Bad timestamps in portfolio CSV.")
+                df = df.drop(columns=[ts_col])
+                df.index = pd.DatetimeIndex(ts, name="timestamp")
+                # Numeric coercion
+                for c in df.columns:
+                    df[c] = pd.to_numeric(df[c], errors="coerce")
+                df = df.dropna(how="any")
+                # Ensure float dtypes
+                df = df.astype("float64")
+                return df.sort_index()
+    except Exception:
+        pass
+
+    # Flat header fallback
+    df2 = pd.read_csv(p)
+    if "timestamp" not in df2.columns:
+        raise ValueError("Portfolio CSV missing 'timestamp' column.")
+    ts = pd.to_datetime(df2.pop("timestamp"), utc=True, errors="coerce")
+    if ts.isna().any():
+        raise ValueError("Bad timestamps in portfolio CSV.")
+    df2.index = pd.DatetimeIndex(ts, name="timestamp")
+    # Try to split columns like 'ASSET.close' into a MultiIndex
+    if any("." in c for c in df2.columns):
+        tuples = [tuple(c.split(".", 1)) for c in df2.columns]
+        mi = pd.MultiIndex.from_tuples(tuples, names=["symbol", "field"])
+        df2.columns = mi
+    # numeric coercion
+    for c in df2.columns:
+        df2[c] = pd.to_numeric(df2[c], errors="coerce")
+    df2 = df2.dropna(how="any").astype("float64")
+    return df2.sort_index()
+
+
 def _load_prices_from_csv(csv_path: Union[str, Path]) -> pd.DataFrame:
     # Try portfolio (multi-asset) loader first; fall back to single-asset OHLCV
+    if load_portfolio_csv is not None:
+        try:
+            return load_portfolio_csv(csv_path)  # type: ignore[misc]
+        except Exception:
+            pass
+    # Try local generic portfolio loader
     try:
-        dfp = load_portfolio_csv(csv_path)
-        return dfp
+        return _generic_load_portfolio_csv(csv_path)
     except Exception:
         scheme = DataScheme(path=csv_path)
         return load_ohlcv_csv(scheme)
@@ -415,6 +479,12 @@ def run_on_csv(
         weights, holdings, equity, trades, metrics, artifacts
     """
     df = _load_prices_from_csv(csv_path)
+    # Ensure tz-aware UTC index
+    if not isinstance(df.index, pd.DatetimeIndex):
+        raise TypeError("CSV must yield a DatetimeIndex.")
+    if df.index.tz is None:
+        df.index = df.index.tz_localize("UTC")
+
     strat = _coerce_strategy(strategy_or_model)
 
     # Produce weights
@@ -432,7 +502,7 @@ def run_on_csv(
     P = _build_prices_panel_for_weights(df, W, cash_col=CASH_COL, field="close")
 
     # Holdings (units) + equity
-    H = weights_to_holdings_df(
+    H: HoldingsResult = weights_to_holdings_df(
         weights=W,
         prices=P,
         cash_col=CASH_COL,
@@ -465,7 +535,6 @@ def run_on_csv(
         elif k == "cagr":
             metrics_out["cagr_years"] = cagr(equity_ser, time_unit="years")
         elif k == "sharpe":
-            # metrics.sharpe expects rf per chosen unit; we pass 0.0 by default.
             metrics_out["sharpe"] = sharpe(
                 rp_ser, bars_per_unit=bars_per_year, rf=0.0, ddof=0
             )
@@ -481,7 +550,7 @@ def run_on_csv(
         elif k == "hit_rate":
             metrics_out["hit_rate"] = hit_rate(rp_ser)
         else:
-            # ignored unknown keys to keep robust; could raise instead
+            # ignore unknown keys to keep robust
             pass
 
     artifacts.update(

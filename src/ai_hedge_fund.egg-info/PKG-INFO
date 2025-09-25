@@ -1,0 +1,19 @@
+Metadata-Version: 2.4
+Name: ai-hedge-fund
+Version: 0.1.0
+Summary: Research-grade trading/backtesting toolkit
+Author: Your Name
+License: MIT License
+        
+Requires-Python: <3.13,>=3.11
+Description-Content-Type: text/markdown
+License-File: LICENSE
+Requires-Dist: numpy<3,>=1.26
+Requires-Dist: pandas<3,>=2.0
+Requires-Dist: requests>=2.31
+Requires-Dist: matplotlib<4,>=3.8
+Provides-Extra: torch
+Requires-Dist: torch>=2.1; extra == "torch"
+Dynamic: license-file
+
+# AI Hedge Fund - MVP
