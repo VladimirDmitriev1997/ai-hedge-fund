@@ -32,7 +32,7 @@ Notes
 """
 
 from __future__ import annotations
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, fields
 from typing import (
     Any,
     Dict,
@@ -374,6 +374,40 @@ def _eval_loss_for_weights(
     if hasattr(loss_val, "item"):
         return float(loss_val.item())
     return float(loss_val)
+
+
+# --- add these small helpers somewhere above train_on_csv in run.py ---
+
+
+def _extract_single_asset_ohlcv(df: pd.DataFrame, asset: str) -> pd.DataFrame:
+    """
+    From a MultiIndex (symbol, field) frame, extract one asset into a flat OHLCV frame.
+    """
+    fields = ["open", "high", "low", "close", "volume"]
+    need = [(asset, f) for f in fields]
+    missing = [c for c in need if c not in df.columns]
+    if missing:
+        raise KeyError(
+            f"{asset}: not found in portfolio frame (need {asset}.close or OHLCV)."
+        )
+    out = pd.DataFrame({f: df[(asset, f)] for f in fields}, index=df.index)
+    # numeric + clean
+    for c in fields:
+        out[c] = pd.to_numeric(out[c], errors="coerce")
+    out = out.dropna(how="any").astype("float64")
+    return out
+
+
+def _returns_with_cash(
+    returns_risky: pd.DataFrame, cash_col: str = CASH_COL
+) -> pd.DataFrame:
+    """
+    Append a zero return CASH column and ensure CASH is last.
+    """
+    R = returns_risky.copy()
+    R[cash_col] = 0.0
+    cols = [c for c in R.columns if c != cash_col] + [cash_col]
+    return R.loc[:, cols].astype("float64")
 
 
 def _iter_grid(param_grid: Mapping[str, Sequence[Any]]) -> Iterable[Dict[str, Any]]:
@@ -941,3 +975,17 @@ def _load_state_into_params(params: Sequence[Any], state: Mapping[str, torch.Ten
         key = f"p_{i}"
         if key in state:
             p.data.copy_(state[key].to(p.data.device))
+
+
+def _mk_learning(**kwargs) -> LearningConfig:
+    allowed = {f.name for f in fields(LearningConfig)}
+    payload = {k: v for k, v in kwargs.items() if k in allowed}
+    print("[learning] applying keys:", sorted(payload.keys()))
+    return LearningConfig(**payload)
+
+
+def _mk_optimization(**kwargs) -> OptimizationConfig:
+    allowed = {f.name for f in fields(OptimizationConfig)}
+    payload = {k: v for k, v in kwargs.items() if k in allowed}
+    print("[optimization] applying keys:", sorted(payload.keys()))
+    return OptimizationConfig(**payload)

@@ -5,9 +5,10 @@ High-level runners for training and evaluating strategies on CSV data.
 This module exposes two workflows:
 
 1) train_on_csv(...)
-   - Load an OHLCV CSV.
+   - Load an OHLCV or portfolio CSV.
    - Initialize a strategy by name (from a registry) with given params.
-   - Fit it with a chosen optimization mode and objective (via learning.py).
+   - Prepare data per strategy scope (single-asset vs multi-asset).
+   - Fit with a chosen optimization mode/objective (via learning.py).
    - Save the fitted model + training metadata into ./models.
    - Return (strategy, FitResult, model_path).
 
@@ -19,9 +20,9 @@ This module exposes two workflows:
 
 Notes
 -----
-- Assumes single-asset CSVs by default (OHLCV columns). Multi-asset
-  "portfolio" CSVs created by your data helpers are supported if you pass
-  a prices DataFrame with columns per asset (or MultiIndex (asset, "close")).
+- Portfolio CSVs are expected to have MultiIndex columns (symbol, field), where
+  the field includes at least "close" (and optionally open/high/low/volume).
+- Single-asset CSVs must have columns: timestamp, open, high, low, close, volume.
 - Risk-free 'rf' is optional; if provided as a per-bar Series aligned to the
   index, it is used in holdings conversion and Sharpe (see metrics).
 """
@@ -74,10 +75,9 @@ from hedge.metrics import (
 )
 
 # ---------------------------------------------------------------------
-# Strategy
+# Strategy registry
 # ---------------------------------------------------------------------
 
-# Map public names → constructors. Extend as you add new strategies.
 STRATEGY_REGISTRY: Dict[str, Any] = {
     "single-asset-ma-crossover": SingleAssetMACrossover,
     # "xsec-momentum": CrossSectionalMomentum,  # when implemented
@@ -103,7 +103,7 @@ def _resolve_strategy(
 
 
 # ---------------------------------------------------------------------
-# Model
+# Model I/O
 # ---------------------------------------------------------------------
 
 
@@ -135,6 +135,59 @@ def _model_payload(
             "history": fit.history,
         }
     return payload
+
+
+# --- add to run.py (helpers section) ---
+
+
+def _coerce_rf_like(rf_obj: Any, T: int) -> Any:
+    """
+    Normalize risk-free input so portfolio alignment can always assign into a 1-D slice.
+
+    Accepts:
+      - scalar (float/int) -> float
+      - pd.Series of length T -> 1-D np.ndarray (T,)
+      - pd.DataFrame with one column (T,1) -> 1-D np.ndarray (T,)
+      - np.ndarray (T,) -> 1-D unchanged
+      - np.ndarray (T,1) -> squeezed to (T,)
+
+    Raises if given a mismatched length.
+    """
+    import numpy as _np
+    import pandas as _pd
+
+    if rf_obj is None:
+        return 0.0
+    # Scalars
+    if _np.isscalar(rf_obj):
+        return float(rf_obj)
+
+    # pandas
+    if isinstance(rf_obj, _pd.Series):
+        arr = rf_obj.to_numpy()
+        if arr.ndim != 1:
+            arr = arr.reshape(-1)
+        if arr.shape[0] != T:
+            raise ValueError(f"rf Series length {arr.shape[0]} != T={T}")
+        return arr
+
+    if isinstance(rf_obj, _pd.DataFrame):
+        if rf_obj.shape[1] != 1:
+            raise ValueError("rf DataFrame must have exactly one column.")
+        arr = rf_obj.to_numpy().reshape(-1)  # (T,1) -> (T,)
+        if arr.shape[0] != T:
+            raise ValueError(f"rf DataFrame length {arr.shape[0]} != T={T}")
+        return arr
+
+    # numpy
+    arr = _np.asarray(rf_obj)
+    if arr.ndim == 2 and arr.shape[1] == 1:
+        arr = arr.reshape(-1)
+    elif arr.ndim > 1:
+        raise ValueError("rf must be scalar, (T,), or (T,1).")
+    if arr.ndim == 1 and arr.shape[0] != T:
+        raise ValueError(f"rf length {arr.shape[0]} != T={T}")
+    return arr
 
 
 def _save_model_json(
@@ -174,7 +227,7 @@ def load_model(path: Union[str, Path]) -> BaseStrategy:
 
 
 # ---------------------------------------------------------------------
-# Helpers
+# CSV loaders & training helpers
 # ---------------------------------------------------------------------
 
 
@@ -233,65 +286,225 @@ def _generic_load_portfolio_csv(path: Union[str, Path]) -> pd.DataFrame:
     return df2.sort_index()
 
 
+# --- replace in run.py ---
+
+
 def _load_prices_from_csv(csv_path: Union[str, Path]) -> pd.DataFrame:
-    # Try portfolio (multi-asset) loader first; fall back to single-asset OHLCV
+    """
+    Robustly load either:
+      - Single-asset OHLCV CSV → flat columns (open/high/low/close/volume)
+      - Portfolio CSV → MultiIndex columns (symbol, field) or flat 'ASSET.close'
+    Preference order:
+      1) Single-asset OHLCV (strict schema)
+      2) Portfolio (official loader, if available)
+      3) Portfolio (generic fallback)
+    """
+    # 1) Try strict single-asset OHLCV first — this avoids misdetecting
+    #    simple CSVs as degenerate MultiIndex.
+    try:
+        scheme = DataScheme(path=csv_path)
+        df_ohlc = load_ohlcv_csv(scheme)
+        return df_ohlc
+    except Exception:
+        pass
+
+    # 2) Portfolio loader (if exported)
     if load_portfolio_csv is not None:
         try:
             return load_portfolio_csv(csv_path)  # type: ignore[misc]
         except Exception:
             pass
-    # Try local generic portfolio loader
+
+    # 3) Generic portfolio fallback
+    return _generic_load_portfolio_csv(csv_path)
+
+
+def _generic_load_portfolio_csv(path: Union[str, Path]) -> pd.DataFrame:
+    """
+    Load a 'portfolio_<code>.csv' written with MultiIndex columns
+    (two header rows) OR a flat form like 'BTCUSDT.close'.
+
+    Returns a DataFrame with tz-aware UTC DatetimeIndex named 'timestamp'.
+    """
+    p = Path(path)
+
+    # Helper: detect a *real* two-level header (not degenerate)
+    def _valid_multiindex_columns(cols: pd.Index) -> bool:
+        if not isinstance(cols, pd.MultiIndex):
+            return False
+        # level-1 must be meaningful (not all NaN/empty/‘Unnamed’)
+        lvl1 = pd.Index(
+            [str(x) if x is not None else "" for x in cols.get_level_values(1)]
+        )
+        if all((x == "") or x.lower().startswith("unnamed") for x in lvl1):
+            return False
+        # level-0 must contain 'timestamp' and at least one *symbol* besides it
+        lvl0 = pd.Index(
+            [str(x) if x is not None else "" for x in cols.get_level_values(0)]
+        )
+        has_ts = any(x.lower() == "timestamp" for x in lvl0)
+        has_sym = any((x != "") and (x.lower() != "timestamp") for x in lvl0)
+        return has_ts and has_sym
+
+    # Try two-row header first, but only accept if it's a *valid* portfolio grid.
     try:
-        return _generic_load_portfolio_csv(csv_path)
+        df2 = pd.read_csv(p, header=[0, 1])
+        if _valid_multiindex_columns(df2.columns):
+            # find the timestamp column at level 0
+            ts_candidates = [
+                c
+                for c in df2.columns
+                if isinstance(c, tuple) and str(c[0]).lower() == "timestamp"
+            ]
+            if ts_candidates:
+                ts_col = ts_candidates[0]
+                ts = pd.to_datetime(df2[ts_col], utc=True, errors="coerce")
+                if ts.isna().any():
+                    raise ValueError("Bad timestamps in portfolio CSV.")
+                df2 = df2.drop(columns=[ts_col])
+                df2.index = pd.DatetimeIndex(ts, name="timestamp")
+                # numeric coercion
+                for c in df2.columns:
+                    df2[c] = pd.to_numeric(df2[c], errors="coerce")
+                df2 = df2.dropna(how="any").astype("float64")
+                return df2.sort_index()
+        # else: fall through to flat header parsing
     except Exception:
-        scheme = DataScheme(path=csv_path)
-        return load_ohlcv_csv(scheme)
+        pass
+
+    # Flat header fallback (expects 'timestamp' + per-asset columns or 'ASSET.field')
+    df = pd.read_csv(p)
+    if "timestamp" not in df.columns:
+        raise ValueError("Portfolio CSV missing 'timestamp' column.")
+    ts = pd.to_datetime(df.pop("timestamp"), utc=True, errors="coerce")
+    if ts.isna().any():
+        raise ValueError("Bad timestamps in portfolio CSV.")
+    df.index = pd.DatetimeIndex(ts, name="timestamp")
+
+    # If columns look like 'ASSET.field', promote to MultiIndex
+    if any("." in str(c) for c in df.columns):
+        tuples = [tuple(str(c).split(".", 1)) for c in df.columns]
+        mi = pd.MultiIndex.from_tuples(tuples, names=["symbol", "field"])
+        df.columns = mi
+
+    # numeric coercion
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    df = df.dropna(how="any").astype("float64")
+    return df.sort_index()
 
 
-def _build_prices_panel_for_weights(
-    df: pd.DataFrame,
-    weights: pd.DataFrame,
-    *,
-    cash_col: str = CASH_COL,
-    field: str = "close",
-) -> pd.DataFrame:
+def _is_single_asset_ohlcv(df: pd.DataFrame) -> bool:
+    cols = (
+        set(map(str.lower, df.columns))
+        if not isinstance(df.columns, pd.MultiIndex)
+        else set()
+    )
+    return {"open", "high", "low", "close", "volume"}.issubset(cols)
+
+
+def _extract_single_asset_ohlcv(df: pd.DataFrame, asset: str) -> pd.DataFrame:
     """
-    Construct a prices frame with columns for each risky asset in `weights`.
-    Supports single-asset OHLCV and MultiIndex portfolio DataFrames.
-
+    From a portfolio DataFrame (MultiIndex), extract OHLCV for `asset`.
+    If only (asset,'close') exists, synthesize minimal OHLC around close.
     """
-    risky = [c for c in weights.columns if c != cash_col]
+    if not isinstance(df.columns, pd.MultiIndex):
+        # Already single-asset OHLCV? Return as-is (validated by caller).
+        return df
 
+    sym = str(asset).upper()
+    have_fields = [
+        f for f in ("open", "high", "low", "close", "volume") if (sym, f) in df.columns
+    ]
+    if have_fields:
+        sub = df.loc[:, pd.MultiIndex.from_product([[sym], have_fields])]
+        sub.columns = [f for _, f in sub.columns]  # flatten fields
+        # pad missing
+        for c in ("open", "high", "low", "close", "volume"):
+            if c not in sub.columns:
+                if c == "volume":
+                    sub[c] = 0.0
+                else:
+                    close = sub["close"].astype(float)
+                    if c == "open":
+                        sub[c] = close.shift(1).fillna(close.iloc[0])
+                    elif c == "high":
+                        sub[c] = np.maximum(sub.get("open", close), close)
+                    elif c == "low":
+                        sub[c] = np.minimum(sub.get("open", close), close)
+        sub = sub[["open", "high", "low", "close", "volume"]].astype("float64")
+        sub.index = pd.DatetimeIndex(df.index, name="timestamp")
+        return sub
+
+    # only close available?
+    if (sym, "close") not in df.columns:
+        raise KeyError(
+            f"{sym}: not found in portfolio frame (need {sym}.close or OHLCV)."
+        )
+    c = df[(sym, "close")].astype(float)
+    o = c.shift(1).fillna(c.iloc[0])
+    h = np.maximum(o, c)
+    l = np.minimum(o, c)
+    v = pd.Series(0.0, index=c.index)
+    out = pd.DataFrame({"open": o, "high": h, "low": l, "close": c, "volume": v})
+    out.index = pd.DatetimeIndex(df.index, name="timestamp")
+    return out.astype("float64")
+
+
+def _infer_universe(strategy: BaseStrategy, df: pd.DataFrame) -> List[str]:
+    """
+    Determine training universe for a multi-asset strategy.
+    Priority:
+      1) strategy.assets or strategy.universe or strategy.symbols  (first found)
+      2) All symbols in df (if MultiIndex)
+    """
+    for attr in ("assets", "universe", "symbols"):
+        if hasattr(strategy, attr):
+            val = getattr(strategy, attr)
+            if isinstance(val, (list, tuple)) and len(val) > 0:
+                return [str(x).upper() for x in val]
+    if isinstance(df.columns, pd.MultiIndex) and "symbol" in (df.columns.names or []):
+        return sorted(
+            list({str(s).upper() for s in df.columns.get_level_values("symbol")})
+        )
+    raise ValueError(
+        "Cannot infer multi-asset universe: provide a portfolio CSV with MultiIndex columns "
+        "or set `strategy.assets` / `strategy.universe` explicitly."
+    )
+
+
+def _close_panel_from_df(df: pd.DataFrame, universe: Sequence[str]) -> pd.DataFrame:
+    """
+    Build a (T, M) close-price panel for a list of assets.
+    Accepts portfolio MultiIndex df or a flat per-asset price table.
+    """
     if isinstance(df.columns, pd.MultiIndex):
-        # Expect (asset, field) style columns
-        missing = [(a, field) for a in risky if (a, field) not in df.columns]
+        missing = [(a, "close") for a in universe if (a, "close") not in df.columns]
         if missing:
-            raise KeyError(f"Missing price columns in input: {missing}")
-        P = pd.concat([df[(a, field)].rename(a) for a in risky], axis=1)
-    else:
-        # Single-asset or flat portfolio with separate columns per asset
-        if set(["open", "high", "low", "close", "volume"]).issubset(df.columns):
-            if len(risky) != 1:
-                raise ValueError(
-                    "Single-asset OHLCV detected, but weights have multiple risky assets."
-                )
-            P = pd.DataFrame({risky[0]: df["close"]}, index=df.index)
-        else:
-            missing = [a for a in risky if a not in df.columns]
-            if missing:
-                raise KeyError(f"Missing price columns for risky assets: {missing}")
-            P = df[risky].copy()
+            raise KeyError(f"Missing close columns for: {missing}")
+        P = pd.concat([df[(a, "close")].rename(a) for a in universe], axis=1)
+        return P.astype("float64")
 
-    if (P <= 0).any().any():
-        raise ValueError("Non-positive prices encountered.")
-    return P
+    # Flat: if it's single-asset OHLCV, require len(universe)==1
+    if _is_single_asset_ohlcv(df):
+        if len(universe) != 1:
+            raise ValueError(
+                "Single-asset OHLCV provided but multi-asset universe requested. "
+                "Either pass a portfolio CSV or restrict the universe to one asset."
+            )
+        return pd.DataFrame(
+            {universe[0]: df["close"].astype("float64")}, index=df.index
+        )
+
+    # Otherwise expect per-asset columns already (e.g., ['BTCUSDT','ETHUSDT',...])
+    for a in universe:
+        if a not in df.columns:
+            raise KeyError(f"Missing price column for asset: {a}")
+    return df.loc[:, list(universe)].astype("float64")
 
 
 def _estimate_bars_per_year(idx: pd.DatetimeIndex) -> float:
-    """
-    Estimate bars-per-year from median spacing.
-
-    """
+    """Estimate bars-per-year from median spacing."""
     if len(idx) < 2:
         return 252.0
     deltas = idx.to_series().diff().dropna().dt.total_seconds()
@@ -328,7 +541,7 @@ class RunResult:
 
 
 # ---------------------------------------------------------------------
-# Training workflow
+# Training workflow (single-asset OR multi-asset)
 # ---------------------------------------------------------------------
 
 
@@ -343,58 +556,195 @@ def train_on_csv(
     code_hint: Optional[str] = None,
 ) -> TrainResult:
     """
-    Train (fit) a strategy on an OHLCV CSV and save the model.
+    Train (fit) a strategy on a CSV and save the model.
+
+    - If the strategy is single-asset:
+        * Accepts either a single-asset OHLCV CSV or a portfolio CSV.
+        * For portfolio CSVs, extracts the target asset's OHLCV (synthesizes OHLC
+          from close if needed) using `strategy.asset`.
+        * Builds `asset_returns` from that asset's close.
+
+    - If the strategy is multi-asset:
+        * Accepts a portfolio CSV (MultiIndex preferred). If a single-asset OHLCV
+          CSV is provided, it is allowed only if the inferred universe has one asset.
+        * Determines the universe from `strategy.assets` / `strategy.universe` /
+          `strategy.symbols` (case-insensitive). If none provided, uses symbols
+          present in the CSV (MultiIndex level 0).
+        * Builds a close-price panel for the universe and `asset_returns` as pct_change.
 
     Parameters
     ----------
     csv_path : str | Path
-        Path to CSV with columns: timestamp, open, high, low, close, volume.
+        Path to an OHLCV or portfolio CSV.
     strategy_name : str | BaseStrategy
-        Strategy key from registry or an already constructed instance.
+        Strategy registry key or an already constructed instance.
     strategy_params : mapping, optional
-        Params passed to the strategy constructor (if name provided).
+        Constructor params (if `strategy_name` is a key).
     learning : LearningConfig | mapping, optional
-        Objective/cost/RF configuration (per-bar rf if you provide one).
+        Objective/cost/RF configuration.
     optimization : OptimizationConfig | mapping, optional
         Optimization mode and hyperparameters.
     model_dir : str | Path, default "models"
         Directory to store saved models (JSON).
     code_hint : str, optional
-        Extra suffix in saved filename (e.g., symbol or dataset code).
+        Suffix in saved filename (e.g., symbol or dataset code).
 
     Returns
     -------
     TrainResult
-        (strategy, fit result, model path, data meta)
     """
-    df = _load_prices_from_csv(csv_path)
+
+    # -------- Local helpers (kept inside to avoid external deps) --------
+    def _is_single_asset_ohlcv_local(df: pd.DataFrame) -> bool:
+        need = {"open", "high", "low", "close", "volume"}
+        return (not isinstance(df.columns, pd.MultiIndex)) and need.issubset(
+            set(map(str, df.columns))
+        )
+
+    def _extract_single_asset_ohlcv_local(df: pd.DataFrame, asset: str) -> pd.DataFrame:
+        asset = str(asset).upper()
+        if isinstance(df.columns, pd.MultiIndex):
+            # Expect (symbol, field)
+            have_close = (asset, "close") in df.columns
+            if not have_close:
+                raise KeyError(
+                    f"{asset}: not found in portfolio frame (need {asset}.close)."
+                )
+            c = df[(asset, "close")].astype(float)
+            # Synthesize OHLC and volume if missing
+            o = c.shift(1).fillna(c.iloc[0])
+            h = c
+            l = c
+            v = pd.Series(0.0, index=c.index)
+            out = pd.DataFrame(
+                {"open": o, "high": h, "low": l, "close": c, "volume": v}
+            )
+            out.index = df.index
+            return out.astype("float64")
+        # Flat portfolio with separate columns per asset (e.g., BTCUSDT, ETHUSDT)
+        if asset in df.columns and "close" not in df.columns:
+            c = pd.to_numeric(df[asset], errors="coerce").astype(float)
+            o = c.shift(1).fillna(c.iloc[0])
+            h = c
+            l = c
+            v = pd.Series(0.0, index=c.index)
+            out = pd.DataFrame(
+                {"open": o, "high": h, "low": l, "close": c, "volume": v}
+            )
+            out.index = df.index
+            return out.astype("float64")
+        raise KeyError(
+            f"{asset}: not found in portfolio frame (need {asset}.close or OHLCV)."
+        )
+
+    def _infer_universe_local(strategy: BaseStrategy, df: pd.DataFrame) -> list[str]:
+        # Strategy hints
+        for attr in ("assets", "universe", "symbols"):
+            val = getattr(strategy, attr, None)
+            if val is not None:
+                seq = list(val) if isinstance(val, (list, tuple, set)) else [val]
+                uni = [str(s).upper() for s in seq]
+                if len(uni) > 0:
+                    return uni
+        # From data
+        if isinstance(df.columns, pd.MultiIndex):
+            return [str(s).upper() for s in df.columns.get_level_values(0).unique()]
+        # Single-asset OHLCV → fall back to strategy.asset if present
+        a = getattr(strategy, "asset", None)
+        if a:
+            return [str(a).upper()]
+        raise ValueError(
+            "Cannot infer universe: provide strategy.assets/universe/symbols or use portfolio CSV."
+        )
+
+    def _close_panel_from_df_local(
+        df: pd.DataFrame, universe: list[str]
+    ) -> pd.DataFrame:
+        if isinstance(df.columns, pd.MultiIndex):
+            missing = [(s, "close") for s in universe if (s, "close") not in df.columns]
+            if missing:
+                raise KeyError(f"Missing close columns for: {missing}")
+            return pd.concat(
+                [df[(s, "close")].rename(s).astype(float) for s in universe], axis=1
+            )
+        # Single-asset OHLCV accepted only if universe is length 1
+        if _is_single_asset_ohlcv_local(df):
+            if len(universe) != 1:
+                raise ValueError(
+                    "Single-asset OHLCV provided but multi-asset universe requested."
+                )
+            return pd.DataFrame(
+                {universe[0]: df["close"].astype(float)}, index=df.index
+            )
+        # Flat portfolio with separate columns per asset (prices only)
+        missing = [s for s in universe if s not in df.columns]
+        if missing:
+            raise KeyError(f"Missing price columns for: {missing}")
+        return df[universe].astype(float)
+
+    def _coerce_rf_like_local(rf_obj: Any, T: int) -> Any:
+        import numpy as _np
+        import pandas as _pd
+
+        if rf_obj is None:
+            return 0.0
+        if _np.isscalar(rf_obj):
+            return float(rf_obj)
+        if isinstance(rf_obj, _pd.Series):
+            arr = rf_obj.to_numpy()
+            return arr.reshape(-1) if arr.ndim != 1 else arr
+        if isinstance(rf_obj, _pd.DataFrame):
+            if rf_obj.shape[1] != 1:
+                raise ValueError("rf DataFrame must have exactly one column.")
+            return rf_obj.to_numpy().reshape(-1)
+        arr = _np.asarray(rf_obj)
+        if arr.ndim == 2 and arr.shape[1] == 1:
+            arr = arr.reshape(-1)
+        elif arr.ndim > 1:
+            raise ValueError("rf must be scalar, (T,), or (T,1).")
+        return arr
+
+    # ----------------------- Load & normalize data -----------------------
+    df_raw = _load_prices_from_csv(csv_path)
+
+    # Ensure tz-aware UTC index
+    if not isinstance(df_raw.index, pd.DatetimeIndex):
+        raise TypeError("CSV must yield a DatetimeIndex.")
+    if df_raw.index.tz is None:
+        df_raw.index = df_raw.index.tz_localize("UTC")
 
     # Resolve strategy
     strategy_params = dict(strategy_params or {})
     strategy = _resolve_strategy(strategy_name, **strategy_params)
 
-    # Build per-asset returns for training
-    # Single-asset default: one risky leg called by strategy.asset
-    if isinstance(df.columns, pd.MultiIndex):
-        raise NotImplementedError(
-            "Multi-asset training from a single CSV is not supported here. "
-            "Use your portfolio data builder and pass returns accordingly."
-        )
+    # ---------- Prepare df_for_fit and asset_returns per strategy scope ----------
+    if getattr(strategy, "is_multi_asset", None) and strategy.is_multi_asset():
+        # MULTI-ASSET STRATEGY
+        universe = _infer_universe_local(strategy, df_raw)  # raises if cannot infer
+        P = _close_panel_from_df_local(df_raw, universe=universe).astype(
+            "float64"
+        )  # (T, M) prices
+        asset_returns = P.pct_change().fillna(0.0).astype("float64")
+        df_for_fit = df_raw  # pass the full portfolio frame to the strategy
+        data_universe = list(P.columns)
+    else:
+        # SINGLE-ASSET STRATEGY
+        if not hasattr(strategy, "asset"):
+            raise AttributeError(
+                "Single-asset training requires the strategy to expose `.asset`."
+            )
+        asset = str(getattr(strategy, "asset")).upper()
+        if _is_single_asset_ohlcv_local(df_raw):
+            df_for_fit = df_raw.astype("float64")
+        else:
+            df_for_fit = _extract_single_asset_ohlcv_local(df_raw, asset=asset)
+        asset_returns = pd.DataFrame(
+            {asset: df_for_fit["close"].pct_change().fillna(0.0).astype(float)},
+            index=df_for_fit.index,
+        ).astype("float64")
+        data_universe = [asset]
 
-    # Risky returns: simple returns of close under column strategy.asset
-    if not hasattr(strategy, "asset"):
-        raise AttributeError(
-            "Strategy must expose `.asset` for single-asset training with CSV."
-        )
-    risky_col_name = getattr(strategy, "asset")
-    asset_returns = pd.DataFrame(
-        {risky_col_name: df["close"].pct_change()},
-        index=df.index,
-    ).fillna(
-        0.0
-    )  # first bar 0
-
-    # Learning / Optimization configs
+    # ---------- Learning / Optimization configs ----------
     if learning is None:
         learning = LearningConfig()
     elif isinstance(learning, Mapping):
@@ -405,22 +755,44 @@ def train_on_csv(
     elif isinstance(optimization, Mapping):
         optimization = OptimizationConfig(**optimization)  # type: ignore[arg-type]
 
-    # Fit
+    # ---------- Normalize risk-free (rf) to scalar or 1-D (T,) ----------
+    T = int(len(asset_returns))
+    try:
+        if hasattr(learning, "rf"):
+            setattr(learning, "rf", _coerce_rf_like_local(getattr(learning, "rf"), T))
+        if hasattr(learning, "objective") and hasattr(
+            learning.objective, "rf_per_period"
+        ):
+            rf_pp = getattr(learning.objective, "rf_per_period")
+            setattr(
+                learning.objective, "rf_per_period", _coerce_rf_like_local(rf_pp, T)
+            )
+    except Exception:
+        # Leave as-is if not applicable; keeps backward compatibility
+        pass
+
+    # ---------- Fit ----------
     fit = fit_strategy(
         strategy=strategy,
-        df=df,
+        df=df_for_fit,
         asset_returns=asset_returns,
         learning=learning,
         optimization=optimization,
     )
 
-    # Save model
+    # ---------- Save model ----------
     data_meta = {
         "csv_path": str(Path(csv_path).resolve()),
-        "n_bars": int(len(df)),
-        "index_start": df.index[0].isoformat() if len(df) else None,
-        "index_end": df.index[-1].isoformat() if len(df) else None,
-        "columns": list(df.columns),
+        "n_bars": int(len(df_for_fit)),
+        "index_start": df_for_fit.index[0].isoformat() if len(df_for_fit) else None,
+        "index_end": df_for_fit.index[-1].isoformat() if len(df_for_fit) else None,
+        "columns": (
+            list(df_for_fit.columns)
+            if not isinstance(df_for_fit.columns, pd.MultiIndex)
+            else [tuple(map(str, t)) for t in df_for_fit.columns]
+        ),
+        "universe": list(map(str, data_universe)),
+        "is_multi_asset": bool(getattr(strategy, "is_multi_asset", lambda: False)()),
         "code": code_hint or Path(csv_path).stem,
     }
     payload = _model_payload(strategy, fit, data_meta=data_meta)
@@ -432,21 +804,56 @@ def train_on_csv(
 
 
 # ---------------------------------------------------------------------
-# Inference / evaluation workflow
+# Inference / evaluation workflow (unchanged)
 # ---------------------------------------------------------------------
 
 
 def _coerce_strategy(strategy_or_path: Union[str, Path, BaseStrategy]) -> BaseStrategy:
-    """
-    Accept a strategy instance or a path to a saved model.
-    """
+    """Accept a strategy instance or a path to a saved model."""
     if isinstance(strategy_or_path, BaseStrategy):
         return strategy_or_path
     p = Path(strategy_or_path)
     if p.exists() and p.suffix.lower() == ".json":
         return load_model(p)
-    # else resolve by registry key
     return _resolve_strategy(str(strategy_or_path))
+
+
+def _build_prices_panel_for_weights(
+    df: pd.DataFrame,
+    weights: pd.DataFrame,
+    *,
+    cash_col: str = CASH_COL,
+    field: str = "close",
+) -> pd.DataFrame:
+    """
+    Construct a prices frame with columns for each risky asset in `weights`.
+    Supports single-asset OHLCV and MultiIndex portfolio DataFrames.
+    """
+    risky = [c for c in weights.columns if c != cash_col]
+
+    if isinstance(df.columns, pd.MultiIndex):
+        # Expect (asset, field) style columns
+        missing = [(a, field) for a in risky if (a, field) not in df.columns]
+        if missing:
+            raise KeyError(f"Missing price columns in input: {missing}")
+        P = pd.concat([df[(a, field)].rename(a) for a in risky], axis=1)
+    else:
+        # Single-asset or flat portfolio with separate columns per asset
+        if set(["open", "high", "low", "close", "volume"]).issubset(df.columns):
+            if len(risky) != 1:
+                raise ValueError(
+                    "Single-asset OHLCV detected, but weights have multiple risky assets."
+                )
+            P = pd.DataFrame({risky[0]: df["close"]}, index=df.index)
+        else:
+            missing = [a for a in risky if a not in df.columns]
+            if missing:
+                raise KeyError(f"Missing price columns for risky assets: {missing}")
+            P = df[risky].copy()
+
+    if (P <= 0).any().any():
+        raise ValueError("Non-positive prices encountered.")
+    return P
 
 
 def run_on_csv(
@@ -459,24 +866,6 @@ def run_on_csv(
 ) -> RunResult:
     """
     Evaluate a strategy on a CSV: weights → holdings → equity → metrics.
-
-    Parameters
-    ----------
-    csv_path : str | Path
-        Path to OHLCV (or portfolio) CSV.
-    strategy_or_model : str | Path | BaseStrategy
-        Strategy instance, registry key, or path to saved JSON.
-    metrics : sequence of str, default ('roi','cagr','sharpe','max_drawdown','calmar')
-        Metric keys to compute.
-    rf : float | pd.Series, default 0.0
-        Per-period risk-free (per bar), aligned to the CSV index if Series.
-    init_equity : float, default 1.0
-        Initial equity for holdings sizing.
-
-    Returns
-    -------
-    RunResult
-        weights, holdings, equity, trades, metrics, artifacts
     """
     df = _load_prices_from_csv(csv_path)
     # Ensure tz-aware UTC index
