@@ -3,5 +3,12 @@ pandas<3,>=2.0
 requests>=2.31
 matplotlib<4,>=3.8
 
+[notebooks]
+jupyterlab>=4
+ipykernel
+nbformat
+nbclient
+ipywidgets
+
 [torch]
 torch>=2.1

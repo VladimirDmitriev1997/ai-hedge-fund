@@ -558,108 +558,72 @@ def train_on_csv(
     """
     Train (fit) a strategy on a CSV and save the model.
 
-    - If the strategy is single-asset:
-        * Accepts either a single-asset OHLCV CSV or a portfolio CSV.
-        * For portfolio CSVs, extracts the target asset's OHLCV (synthesizes OHLC
-          from close if needed) using `strategy.asset`.
-        * Builds `asset_returns` from that asset's close.
+    Single-asset strategies:
+      - Accept either single-asset OHLCV CSV or portfolio CSV.
+      - For portfolio CSVs, extract/synthesize OHLCV for `strategy.asset`.
+      - Build asset_returns from close.
 
-    - If the strategy is multi-asset:
-        * Accepts a portfolio CSV (MultiIndex preferred). If a single-asset OHLCV
-          CSV is provided, it is allowed only if the inferred universe has one asset.
-        * Determines the universe from `strategy.assets` / `strategy.universe` /
-          `strategy.symbols` (case-insensitive). If none provided, uses symbols
-          present in the CSV (MultiIndex level 0).
-        * Builds a close-price panel for the universe and `asset_returns` as pct_change.
+    Multi-asset strategies:
+      - Accept portfolio CSV (MultiIndex preferred). Single-asset OHLCV allowed
+        only if the inferred universe has exactly one asset.
+      - Universe taken from strategy (assets/universe/symbols) or from data.
+      - Build a close-price panel and asset_returns as pct_change.
 
-    Parameters
-    ----------
-    csv_path : str | Path
-        Path to an OHLCV or portfolio CSV.
-    strategy_name : str | BaseStrategy
-        Strategy registry key or an already constructed instance.
-    strategy_params : mapping, optional
-        Constructor params (if `strategy_name` is a key).
-    learning : LearningConfig | mapping, optional
-        Objective/cost/RF configuration.
-    optimization : OptimizationConfig | mapping, optional
-        Optimization mode and hyperparameters.
-    model_dir : str | Path, default "models"
-        Directory to store saved models (JSON).
-    code_hint : str, optional
-        Suffix in saved filename (e.g., symbol or dataset code).
-
-    Returns
-    -------
-    TrainResult
+    Implementation detail:
+      - To avoid RF broadcast bugs in portfolio alignment, we *append a CASH
+        return column* (last) to `asset_returns` and set
+        `learning.has_cash_in_returns = True`, so the loss path will not try
+        to inject RF again.
     """
 
-    # -------- Local helpers (kept inside to avoid external deps) --------
-    def _is_single_asset_ohlcv_local(df: pd.DataFrame) -> bool:
-        need = {"open", "high", "low", "close", "volume"}
-        return (not isinstance(df.columns, pd.MultiIndex)) and need.issubset(
-            set(map(str, df.columns))
-        )
+    # -------------------------- local helpers --------------------------
+    def _is_single_asset_ohlcv(df: pd.DataFrame) -> bool:
+        cols = set(map(str, df.columns))
+        return (not isinstance(df.columns, pd.MultiIndex)) and {
+            "open",
+            "high",
+            "low",
+            "close",
+            "volume",
+        }.issubset(cols)
 
-    def _extract_single_asset_ohlcv_local(df: pd.DataFrame, asset: str) -> pd.DataFrame:
-        asset = str(asset).upper()
+    def _extract_single_asset_ohlcv(df: pd.DataFrame, asset: str) -> pd.DataFrame:
+        a = str(asset).upper()
         if isinstance(df.columns, pd.MultiIndex):
-            # Expect (symbol, field)
-            have_close = (asset, "close") in df.columns
-            if not have_close:
-                raise KeyError(
-                    f"{asset}: not found in portfolio frame (need {asset}.close)."
-                )
-            c = df[(asset, "close")].astype(float)
-            # Synthesize OHLC and volume if missing
-            o = c.shift(1).fillna(c.iloc[0])
-            h = c
-            l = c
-            v = pd.Series(0.0, index=c.index)
-            out = pd.DataFrame(
-                {"open": o, "high": h, "low": l, "close": c, "volume": v}
-            )
-            out.index = df.index
-            return out.astype("float64")
-        # Flat portfolio with separate columns per asset (e.g., BTCUSDT, ETHUSDT)
-        if asset in df.columns and "close" not in df.columns:
-            c = pd.to_numeric(df[asset], errors="coerce").astype(float)
-            o = c.shift(1).fillna(c.iloc[0])
-            h = c
-            l = c
-            v = pd.Series(0.0, index=c.index)
-            out = pd.DataFrame(
-                {"open": o, "high": h, "low": l, "close": c, "volume": v}
-            )
-            out.index = df.index
-            return out.astype("float64")
-        raise KeyError(
-            f"{asset}: not found in portfolio frame (need {asset}.close or OHLCV)."
-        )
+            if (a, "close") not in df.columns:
+                raise KeyError(f"{a}: not found (need {a}.close).")
+            c = df[(a, "close")].astype(float)
+        else:
+            if a in df.columns and "close" not in df.columns:
+                c = pd.to_numeric(df[a], errors="coerce").astype(float)
+            else:
+                raise KeyError(f"{a}: not found (need {a}.close or an OHLCV CSV).")
+        o = c.shift(1).fillna(c.iloc[0])
+        h = c
+        l = c
+        v = pd.Series(0.0, index=c.index)
+        out = pd.DataFrame({"open": o, "high": h, "low": l, "close": c, "volume": v})
+        out.index = df.index
+        return out.astype("float64")
 
-    def _infer_universe_local(strategy: BaseStrategy, df: pd.DataFrame) -> list[str]:
-        # Strategy hints
+    def _infer_universe(strategy: BaseStrategy, df: pd.DataFrame) -> list[str]:
         for attr in ("assets", "universe", "symbols"):
-            val = getattr(strategy, attr, None)
-            if val is not None:
-                seq = list(val) if isinstance(val, (list, tuple, set)) else [val]
+            v = getattr(strategy, attr, None)
+            if v is not None:
+                seq = list(v) if isinstance(v, (list, tuple, set)) else [v]
                 uni = [str(s).upper() for s in seq]
-                if len(uni) > 0:
+                if uni:
                     return uni
-        # From data
         if isinstance(df.columns, pd.MultiIndex):
             return [str(s).upper() for s in df.columns.get_level_values(0).unique()]
-        # Single-asset OHLCV → fall back to strategy.asset if present
         a = getattr(strategy, "asset", None)
         if a:
             return [str(a).upper()]
         raise ValueError(
-            "Cannot infer universe: provide strategy.assets/universe/symbols or use portfolio CSV."
+            "Cannot infer universe — provide strategy.assets/universe/symbols or use a portfolio CSV."
         )
 
-    def _close_panel_from_df_local(
-        df: pd.DataFrame, universe: list[str]
-    ) -> pd.DataFrame:
+    def _close_panel_from_df(df: pd.DataFrame, universe: list[str]) -> pd.DataFrame:
         if isinstance(df.columns, pd.MultiIndex):
             missing = [(s, "close") for s in universe if (s, "close") not in df.columns]
             if missing:
@@ -667,8 +631,7 @@ def train_on_csv(
             return pd.concat(
                 [df[(s, "close")].rename(s).astype(float) for s in universe], axis=1
             )
-        # Single-asset OHLCV accepted only if universe is length 1
-        if _is_single_asset_ohlcv_local(df):
+        if _is_single_asset_ohlcv(df):
             if len(universe) != 1:
                 raise ValueError(
                     "Single-asset OHLCV provided but multi-asset universe requested."
@@ -676,38 +639,30 @@ def train_on_csv(
             return pd.DataFrame(
                 {universe[0]: df["close"].astype(float)}, index=df.index
             )
-        # Flat portfolio with separate columns per asset (prices only)
-        missing = [s for s in universe if s not in df.columns]
-        if missing:
-            raise KeyError(f"Missing price columns for: {missing}")
+        miss = [s for s in universe if s not in df.columns]
+        if miss:
+            raise KeyError(f"Missing price columns for: {miss}")
         return df[universe].astype(float)
 
-    def _coerce_rf_like_local(rf_obj: Any, T: int) -> Any:
-        import numpy as _np
-        import pandas as _pd
+    def _rf_scalar(x: Any) -> float:
+        import numpy as _np, pandas as _pd
 
-        if rf_obj is None:
+        if x is None:
             return 0.0
-        if _np.isscalar(rf_obj):
-            return float(rf_obj)
-        if isinstance(rf_obj, _pd.Series):
-            arr = rf_obj.to_numpy()
-            return arr.reshape(-1) if arr.ndim != 1 else arr
-        if isinstance(rf_obj, _pd.DataFrame):
-            if rf_obj.shape[1] != 1:
-                raise ValueError("rf DataFrame must have exactly one column.")
-            return rf_obj.to_numpy().reshape(-1)
-        arr = _np.asarray(rf_obj)
-        if arr.ndim == 2 and arr.shape[1] == 1:
-            arr = arr.reshape(-1)
-        elif arr.ndim > 1:
-            raise ValueError("rf must be scalar, (T,), or (T,1).")
-        return arr
+        if _np.isscalar(x):
+            return float(x)
+        if isinstance(x, (_pd.Series, _pd.DataFrame, list, tuple, _np.ndarray)):
+            arr = _np.asarray(x)
+            if arr.size == 0:
+                return 0.0
+            return float(arr.mean())  # deterministic collapse
+        try:
+            return float(x)
+        except Exception:
+            return 0.0
 
-    # ----------------------- Load & normalize data -----------------------
+    # ---------------------- load & normalize data ----------------------
     df_raw = _load_prices_from_csv(csv_path)
-
-    # Ensure tz-aware UTC index
     if not isinstance(df_raw.index, pd.DatetimeIndex):
         raise TypeError("CSV must yield a DatetimeIndex.")
     if df_raw.index.tz is None:
@@ -717,34 +672,30 @@ def train_on_csv(
     strategy_params = dict(strategy_params or {})
     strategy = _resolve_strategy(strategy_name, **strategy_params)
 
-    # ---------- Prepare df_for_fit and asset_returns per strategy scope ----------
+    # --------------- frame for fit + risky returns panel ---------------
     if getattr(strategy, "is_multi_asset", None) and strategy.is_multi_asset():
-        # MULTI-ASSET STRATEGY
-        universe = _infer_universe_local(strategy, df_raw)  # raises if cannot infer
-        P = _close_panel_from_df_local(df_raw, universe=universe).astype(
-            "float64"
-        )  # (T, M) prices
+        universe = _infer_universe(strategy, df_raw)
+        P = _close_panel_from_df(df_raw, universe=universe).astype("float64")
         asset_returns = P.pct_change().fillna(0.0).astype("float64")
-        df_for_fit = df_raw  # pass the full portfolio frame to the strategy
+        df_for_fit = df_raw
         data_universe = list(P.columns)
     else:
-        # SINGLE-ASSET STRATEGY
         if not hasattr(strategy, "asset"):
             raise AttributeError(
                 "Single-asset training requires the strategy to expose `.asset`."
             )
         asset = str(getattr(strategy, "asset")).upper()
-        if _is_single_asset_ohlcv_local(df_raw):
+        if _is_single_asset_ohlcv(df_raw):
             df_for_fit = df_raw.astype("float64")
         else:
-            df_for_fit = _extract_single_asset_ohlcv_local(df_raw, asset=asset)
+            df_for_fit = _extract_single_asset_ohlcv(df_raw, asset=asset)
         asset_returns = pd.DataFrame(
             {asset: df_for_fit["close"].pct_change().fillna(0.0).astype(float)},
             index=df_for_fit.index,
         ).astype("float64")
         data_universe = [asset]
 
-    # ---------- Learning / Optimization configs ----------
+    # ---------------- learning / optimization configs -----------------
     if learning is None:
         learning = LearningConfig()
     elif isinstance(learning, Mapping):
@@ -755,23 +706,46 @@ def train_on_csv(
     elif isinstance(optimization, Mapping):
         optimization = OptimizationConfig(**optimization)  # type: ignore[arg-type]
 
-    # ---------- Normalize risk-free (rf) to scalar or 1-D (T,) ----------
-    T = int(len(asset_returns))
+    # ---------------------- RF handling (scalar) -----------------------
+    # Determine one scalar RF to use (applies also to CASH column below).
+    rf_candidates = []
+    if hasattr(learning, "rf"):
+        rf_candidates.append(getattr(learning, "rf"))
+    if hasattr(learning, "rf_per_period"):
+        rf_candidates.append(getattr(learning, "rf_per_period"))
+    if hasattr(learning, "objective") and hasattr(learning.objective, "rf_per_period"):
+        rf_candidates.append(getattr(learning.objective, "rf_per_period"))
+    rf_scalar = _rf_scalar(next((x for x in rf_candidates if x is not None), 0.0))
+
+    # Normalize on the objects (keep them scalar to avoid later broadcast paths)
     try:
         if hasattr(learning, "rf"):
-            setattr(learning, "rf", _coerce_rf_like_local(getattr(learning, "rf"), T))
+            setattr(learning, "rf", rf_scalar)
+        if hasattr(learning, "rf_per_period"):
+            setattr(learning, "rf_per_period", rf_scalar)
         if hasattr(learning, "objective") and hasattr(
             learning.objective, "rf_per_period"
         ):
-            rf_pp = getattr(learning.objective, "rf_per_period")
-            setattr(
-                learning.objective, "rf_per_period", _coerce_rf_like_local(rf_pp, T)
-            )
+            setattr(learning.objective, "rf_per_period", rf_scalar)
     except Exception:
-        # Leave as-is if not applicable; keeps backward compatibility
         pass
 
-    # ---------- Fit ----------
+    # ---------------- include CASH in asset_returns --------------------
+    # Make CASH the *last* column, set has_cash_in_returns=True to skip RF injection.
+    cash_series = pd.Series(
+        rf_scalar, index=asset_returns.index, name=CASH_COL, dtype="float64"
+    )
+    asset_returns = pd.concat([asset_returns, cash_series], axis=1).astype("float64")
+
+    # If LearningConfig exposes these fields, set them (safe no-ops otherwise)
+    if hasattr(learning, "has_cash_in_returns"):
+        setattr(learning, "has_cash_in_returns", True)
+    if hasattr(learning, "cash_col_idx"):
+        setattr(
+            learning, "cash_col_idx", None
+        )  # None → treat last column as CASH downstream
+
+    # ------------------------------ fit -------------------------------
     fit = fit_strategy(
         strategy=strategy,
         df=df_for_fit,
@@ -780,7 +754,7 @@ def train_on_csv(
         optimization=optimization,
     )
 
-    # ---------- Save model ----------
+    # --------------------------- save model ---------------------------
     data_meta = {
         "csv_path": str(Path(csv_path).resolve()),
         "n_bars": int(len(df_for_fit)),
@@ -866,6 +840,12 @@ def run_on_csv(
 ) -> RunResult:
     """
     Evaluate a strategy on a CSV: weights → holdings → equity → metrics.
+
+    Implementation detail:
+    - We explicitly construct an asset-returns matrix that ALREADY includes the
+      CASH leg as a 1-D vector (shape (T,)), aligned to the weights column order.
+      Then we call `portfolio_returns(..., has_cash_in_returns=True)` which
+      bypasses the RF-injection branch that causes the (T,1) → (T,) broadcast error.
     """
     df = _load_prices_from_csv(csv_path)
     # Ensure tz-aware UTC index
@@ -903,13 +883,38 @@ def run_on_csv(
     )
     holdings, equity_ser, trades = H.holdings, H.equity, H.trades
 
-    # Portfolio returns from weights + asset returns (derived from prices)
+    # ---------- Metrics: build returns INCLUDING CASH as the last/placed column ----------
     risky_returns = P.pct_change().fillna(0.0)
+
+    T = len(W)
+    # rf as a 1-D vector aligned to W.index
+    if isinstance(rf, pd.Series):
+        rf_vec = rf.reindex(W.index).astype(float).fillna(0.0).to_numpy(dtype=float)
+    else:
+        rf_vec = np.full(T, float(rf), dtype=float)
+
+    # Assemble returns matrix in the SAME column order as W (incl. CASH)
+    ret_cols: list[np.ndarray] = []
+    for col in W.columns:
+        if col == CASH_COL:
+            ret_cols.append(rf_vec)  # 1-D (T,)
+        else:
+            s = (
+                risky_returns[col]
+                .reindex(W.index)
+                .astype(float)
+                .fillna(0.0)
+                .to_numpy(dtype=float)
+            )
+            ret_cols.append(s)
+
+    R_full = np.column_stack(ret_cols)  # shape (T, M), includes CASH
+
     rp = portfolio_returns(
         weights=W.to_numpy(dtype=float),
-        asset_returns=risky_returns.to_numpy(dtype=float),
-        rf=(rf.to_numpy() if isinstance(rf, pd.Series) else rf),
-        has_cash_in_returns=False,
+        asset_returns=R_full,
+        rf=0.0,  # ignored because has_cash_in_returns=True
+        has_cash_in_returns=True,
         cash_col_idx=W.columns.get_loc(CASH_COL),
     )
     rp_ser = pd.Series(rp, index=W.index, name="port_ret")
@@ -939,7 +944,6 @@ def run_on_csv(
         elif k == "hit_rate":
             metrics_out["hit_rate"] = hit_rate(rp_ser)
         else:
-            # ignore unknown keys to keep robust
             pass
 
     artifacts.update(
