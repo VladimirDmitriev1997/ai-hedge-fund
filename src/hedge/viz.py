@@ -580,3 +580,142 @@ def plot_multi_asset_dashboard(
     if show:
         plt.show()
     return fig
+
+
+def plot_run_simple(
+    df: pd.DataFrame,
+    weights: pd.DataFrame,
+    equity: pd.Series,
+    *,
+    asset: str | None = None,
+    price_field: str = "close",
+    top_n_weights: int = 8,
+    figsize: tuple[float, float] = (13, 10),
+    title: str | None = None,
+    metrics: Mapping[str, float | int | str] | None = None,
+    savepath: str | None = None,
+    show: bool = False,
+) -> plt.Figure:
+    """
+    Minimal stacked visualization for a single run (train or test).
+
+    Panels (one per row, no overlays):
+      1) Price (close)
+      2) Equity
+      3) Underwater (drawdown)
+      4) Weights (lines)
+      5) Metrics (text panel, optional)
+
+    df:
+        OHLCV or portfolio frame; if MultiIndex (symbol, field), provide `asset`.
+    weights:
+        DataFrame with columns including CASH; indexed like df/equity.
+    equity:
+        Series aligned to time index.
+    asset:
+        Required when df has MultiIndex columns (choose which asset's price to show).
+    """
+    # ----- extract price series -----
+    if isinstance(df.columns, pd.MultiIndex):
+        if not asset:
+            raise ValueError("Provide `asset` when df has MultiIndex columns.")
+        asset = str(asset).upper()
+        if (asset, price_field) not in df.columns:
+            raise KeyError(f"Missing {asset}.{price_field} in df.")
+        price = df[(asset, price_field)].astype(float)
+        price_name = asset
+    else:
+        if price_field not in df.columns:
+            # fallback to first numeric column
+            num_cols = [c for c in df.columns if np.issubdtype(df[c].dtype, np.number)]
+            if not num_cols:
+                raise KeyError("No numeric price column found.")
+            price_field = num_cols[0]
+        price = df[price_field].astype(float)
+        price_name = price_field
+
+    price = price.reindex(equity.index)
+
+    # ----- underwater -----
+    runup = equity.astype(float).cummax()
+    underwater = (equity.astype(float) / runup) - 1.0
+
+    # ----- set up figure -----
+    nrows = 5 if metrics else 4
+    fig, axes = plt.subplots(nrows, 1, figsize=figsize, sharex=True)
+    axes = np.atleast_1d(axes)
+
+    # 1) Price
+    ax = axes[0]
+    ax.plot(price.index, price.values, linewidth=1.4)
+    ax.set_ylabel("Close")
+    ax.set_title(title or f"{price_name}", fontsize=12)
+    _format_time_axis(ax)
+
+    # 2) Equity
+    ax = axes[1]
+    ax.plot(equity.index, equity.values, linewidth=1.6)
+    ax.set_ylabel("Equity")
+    _format_time_axis(ax)
+
+    # 3) Underwater
+    ax = axes[2]
+    ax.fill_between(underwater.index, underwater.values, 0.0, step="pre", alpha=0.65)
+    ax.set_ylabel("Drawdown")
+    ax.yaxis.set_major_formatter(plt.FuncFormatter(lambda y, _: f"{y:.0%}"))
+    _format_time_axis(ax)
+
+    # 4) Weights (lines; top-N riskies + CASH if present)
+    ax = axes[3]
+    cols = [c for c in weights.columns if str(c) != CASH_COL]
+    # rank by avg |w|
+    avg_abs = (
+        weights[cols].abs().mean().sort_values(ascending=False)
+        if cols
+        else pd.Series(dtype=float)
+    )
+    keep = list(avg_abs.head(max(1, top_n_weights)).index) if len(avg_abs) else []
+    plot_cols = keep + ([CASH_COL] if CASH_COL in weights.columns else [])
+    for c in plot_cols:
+        ax.plot(weights.index, weights[c].values, linewidth=1.1, label=str(c))
+    if plot_cols:
+        ax.legend(loc="upper left", ncols=3, fontsize=8, frameon=False)
+    ax.set_ylabel("Weight")
+    _percent_axis(ax)
+    _format_time_axis(ax)
+
+    # 5) Metrics (text only)
+    if metrics:
+        ax = axes[4]
+        ax.axis("off")
+        lines = []
+        for k, v in metrics.items():
+            if isinstance(v, (float, np.floating)):
+                if any(
+                    s in k.lower() for s in ("roi", "cagr", "drawdown", "mdd", "calmar")
+                ):
+                    lines.append(f"{k}: {v:,.2%}")
+                elif "sharpe" in k.lower():
+                    lines.append(f"{k}: {v:,.2f}")
+                else:
+                    lines.append(f"{k}: {v:,.4f}")
+            else:
+                lines.append(f"{k}: {v}")
+        text = "\n".join(lines)
+        ax.text(
+            0.01,
+            0.98,
+            text,
+            transform=ax.transAxes,
+            ha="left",
+            va="top",
+            fontsize=10,
+            family="monospace",
+        )
+
+    fig.tight_layout()
+    if savepath:
+        fig.savefig(savepath, dpi=140, bbox_inches="tight")
+    if show:
+        plt.show()
+    return fig
