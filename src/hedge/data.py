@@ -230,9 +230,15 @@ def fetch_binance_ohlcv_df(
     *,
     limit_per_call: int = 1000,
     request_pause_sec: float = 0.25,
+    max_retries: int = 3,
 ) -> pd.DataFrame:
     """
-    Download OHLCV from Binance API into a DataFrame with UTC DatetimeIndex.
+    Robust OHLCV downloader using Binance Spot REST /api/v3/klines.
+
+    - Paginates by openTime (k[0]) as recommended.
+    - Uses closeTime as the timestamp index.
+    - Returns columns: open, high, low, close, volume (float64) with tz-aware UTC index.
+    - Raises if no valid rows are returned.
     """
     start_ms = _to_ms(start)
     end_ms = _to_ms(end) if end is not None else _to_ms(datetime.now(timezone.utc))
@@ -240,74 +246,89 @@ def fetch_binance_ohlcv_df(
         raise ValueError("Invalid time range for Binance fetch (check start/end).")
 
     url = f"{_BINANCE_BASE}/api/v3/klines"
-    params = {
+    base = {
         "symbol": symbol.upper(),
         "interval": interval,
         "limit": min(int(limit_per_call), 1000),
     }
 
-    rows: list[tuple[int, str, str, str, str, str]] = []
+    rows: list[list] = []
     cur = start_ms
+
     while True:
-        q = dict(params)
-        q["startTime"] = cur
-        q["endTime"] = end_ms
-        resp = requests.get(url, params=q, timeout=30)
-        if resp.status_code != 200:
-            raise RuntimeError(f"Binance API error {resp.status_code}: {resp.text}")
+        params = dict(base)
+        params["startTime"] = cur
+        params["endTime"] = end_ms
 
-        data = resp.json()
-        if not data:
-            break
-
-        # Each kline: [ openTime, open, high, low, close, volume, closeTime, ... ]
-        for k in data:
-            close_time_ms = int(k[6])
-            if close_time_ms > end_ms:  # guard overshoot
+        # simple retry loop (handles 429 / transient errors)
+        last_err: Exception | None = None
+        for attempt in range(max_retries):
+            try:
+                r = requests.get(url, params=params, timeout=30)
+                # 429 has body but not 200; raise_for_status will catch it
+                r.raise_for_status()
+                data = r.json()
+                # Binance errors sometimes come back as dict {"code": -...,"msg": "..."}
+                if isinstance(data, dict):
+                    raise RuntimeError(f"Binance error: {data}")
                 break
-            rows.append(
-                (
-                    close_time_ms,
-                    k[1],  # open
-                    k[2],  # high
-                    k[3],  # low
-                    k[4],  # close
-                    k[5],  # volume
-                )
-            )
+            except Exception as e:
+                last_err = e
+                # exponential-ish backoff
+                time.sleep(request_pause_sec * (attempt + 1))
+        else:
+            assert last_err is not None
+            raise last_err
 
-        if len(data) < params["limit"]:
+        if not data:
+            # no more data in range
             break
 
-        last_close_ms = int(data[-1][6])
-        if last_close_ms >= end_ms:
+        # Append raw rows; each row has 12 fields
+        rows.extend(data)
+
+        # paginate by openTime -> next start = last_open + 1
+        last_open = int(data[-1][0])
+        if last_open >= end_ms:
             break
-        cur = last_close_ms + 1
+        cur = last_open + 1
         time.sleep(request_pause_sec)
 
     if not rows:
         raise RuntimeError("No data returned for the requested range from Binance.")
 
-    df = pd.DataFrame(
-        rows, columns=["close_time_ms", "open", "high", "low", "close", "volume"]
-    )
-    ts = pd.to_datetime(df["close_time_ms"].astype("int64"), unit="ms", utc=True)
-    out = pd.DataFrame(
-        {
-            "open": pd.to_numeric(df["open"], errors="coerce").astype("float64"),
-            "high": pd.to_numeric(df["high"], errors="coerce").astype("float64"),
-            "low": pd.to_numeric(df["low"], errors="coerce").astype("float64"),
-            "close": pd.to_numeric(df["close"], errors="coerce").astype("float64"),
-            "volume": pd.to_numeric(df["volume"], errors="coerce").astype("float64"),
-        },
-        index=pd.DatetimeIndex(ts, name="timestamp"),
-    ).sort_index()
+    # Build DataFrame from raw kline fields
+    cols_all = [
+        "openTime",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "closeTime",
+        "quoteAssetVolume",
+        "numberOfTrades",
+        "takerBuyBaseAssetVolume",
+        "takerBuyQuoteAssetVolume",
+        "ignore",
+    ]
+    df_raw = pd.DataFrame(rows, columns=cols_all[: len(rows[0])])
 
+    # Select OHLCV and index by closeTime
+    for c in ("open", "high", "low", "close", "volume"):
+        df_raw[c] = pd.to_numeric(df_raw[c], errors="coerce")
+
+    ts = pd.to_datetime(df_raw["closeTime"].astype("int64"), unit="ms", utc=True)
+    out = (
+        df_raw[["open", "high", "low", "close", "volume"]]
+        .set_index(pd.DatetimeIndex(ts, name="timestamp"))
+        .sort_index()
+    )
+
+    # Clean + sanity checks
     out = out[~out.index.duplicated(keep="last")].dropna(how="any")
     if len(out) == 0:
         raise RuntimeError("Binance returned rows, but all were invalid/NaN.")
-
-    # Sanity checks
     if (out[["open", "high", "low", "close"]] < 0).any().any():
         raise ValueError(f"{symbol}: negative price found.")
     if (out["high"] < out["low"]).any():
@@ -315,7 +336,8 @@ def fetch_binance_ohlcv_df(
     if (out["volume"] < 0).any():
         raise ValueError(f"{symbol}: negative volume found.")
 
-    return out
+    # Final dtype normalization
+    return out.astype("float64")
 
 
 def download_binance_ohlcv_csv(
@@ -367,7 +389,7 @@ def _write_ohlcv_csv(df: pd.DataFrame, path: Path) -> None:
 
 def load_dataset_catalog(data_dir: str | Path = "data") -> pd.DataFrame:
     """
-    Load (or initialize empty) single-asset dataset catalog.
+    Load (or initialize empty) single-asset dataset catalog, with normalized columns.
     """
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
@@ -385,9 +407,7 @@ def load_dataset_catalog(data_dir: str | Path = "data") -> pd.DataFrame:
         ]
         return pd.DataFrame(columns=cols)
     cat = pd.read_csv(path)
-    # basic normalization
-    if "code" in cat.columns:
-        cat["code"] = pd.to_numeric(cat["code"], errors="coerce").astype("Int64")
+    cat = _normalize_dataset_catalog(cat)
     return cat
 
 
@@ -421,19 +441,21 @@ def _find_matching_code(
 ) -> Optional[int]:
     if cat.empty:
         return None
-    s = symbol.upper()
-    i = interval
+    s = str(symbol).upper()
+    i = str(interval)
     st = _repr_time_for_catalog(start)
     en = _repr_time_for_catalog(end)
-    m = cat[
-        (cat["symbol"].str.upper() == s)
-        & (cat["interval"] == i)
-        & (cat["start"].fillna("") == st)
-        & (cat["end"].fillna("") == en)
-    ]
-    if m.empty:
+
+    # robust string comparisons in case of NaNs/old catalogs
+    sym_col = cat["symbol"].astype("string").str.upper()
+    int_col = cat["interval"].astype("string")
+    start_col = cat["start"].astype("string").fillna("")
+    end_col = cat["end"].astype("string").fillna("")
+
+    m = (sym_col == s) & (int_col == i) & (start_col == st) & (end_col == en)
+    if not m.any():
         return None
-    return int(m.iloc[0]["code"])
+    return int(cat.loc[m, "code"].iloc[0])
 
 
 def ensure_ohlcv_dataset(
@@ -448,37 +470,32 @@ def ensure_ohlcv_dataset(
     request_pause_sec: float = 0.25,
 ) -> tuple[int, Path]:
     """
-    Ensure an OHLCV dataset exists for the given (symbol, interval, start, end).
-    - If the same spec exists in the catalog and file is present -> reuse.
-    - Else fetch from Binance, assign a new numeric code, save data/<code>.csv,
-      and append to catalog.
-
-    Returns
-    -------
-    (code, path)
+    Ensure an OHLCV dataset exists for (symbol, interval, start, end).
+    Upserts a normalized row into dataset_catalog.csv. If overwrite=True and the
+    same spec exists, the CSV is re-fetched and the catalog row is replaced.
     """
     data_dir = Path(data_dir)
     data_dir.mkdir(parents=True, exist_ok=True)
 
-    cat = load_dataset_catalog(data_dir)
+    cat = load_dataset_catalog(data_dir)  # already normalized
     existing_code = _find_matching_code(cat, symbol, interval, start, end)
 
-    if existing_code is not None and not overwrite:
+    if (existing_code is not None) and not overwrite:
         path = data_dir / f"{existing_code}.csv"
         if path.exists():
             return existing_code, path
-        # file missing: we will re-fetch and re-write using the same code
+        # fall through to re-fetch using the same code
         code = existing_code
     else:
-        # assign new code
+        # assign a new code if there is no exact match
         max_code = (
             int(cat["code"].max())
             if ("code" in cat.columns and not cat["code"].isna().all())
             else 0
         )
-        code = max_code + 1
+        code = max_code + 1 if existing_code is None else existing_code
 
-    # fetch
+    # fetch from Binance
     df = fetch_binance_ohlcv_df(
         symbol=symbol,
         interval=interval,
@@ -488,11 +505,11 @@ def ensure_ohlcv_dataset(
         request_pause_sec=request_pause_sec,
     )
 
-    # write dataset
+    # write dataset file
     path = data_dir / f"{code}.csv"
     _write_ohlcv_csv(df, path)
 
-    # upsert catalog row
+    # build the row and align columns with catalog before upsert
     created = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
     row = {
         "code": int(code),
@@ -504,10 +521,21 @@ def ensure_ohlcv_dataset(
         "created_utc": created,
         "dataset_path": str(path),
     }
-    if existing_code is not None:
-        cat.loc[cat["code"] == existing_code, :] = row
+
+    cat = _normalize_dataset_catalog(cat)  # ensure expected columns exist
+    rep = pd.DataFrame([row])
+    # align both ways (handle legacy catalogs with extra/missing cols)
+    for col in cat.columns:
+        if col not in rep.columns:
+            rep[col] = pd.NA
+    rep = rep[cat.columns]
+
+    if existing_code is not None and (cat["code"] == existing_code).any():
+        mask = cat["code"] == existing_code
+        # replace in-place using raw values to avoid dict/len mismatch
+        cat.loc[mask, :] = rep.values
     else:
-        cat = pd.concat([cat, pd.DataFrame([row])], ignore_index=True)
+        cat = pd.concat([cat, rep], ignore_index=True)
 
     _save_dataset_catalog(cat, data_dir)
     return code, path
@@ -729,6 +757,35 @@ def _normalize_multi_ohlcv(
             if missing:
                 raise KeyError(f"{sym}: missing required fields {missing}")
     return X
+
+
+def _normalize_dataset_catalog(cat: pd.DataFrame) -> pd.DataFrame:
+    """Ensure dataset catalog has the expected columns/dtypes and order."""
+    expected_cols = [
+        "code",
+        "symbol",
+        "interval",
+        "start",
+        "end",
+        "rows",
+        "created_utc",
+        "dataset_path",
+    ]
+    # add any missing columns
+    for col in expected_cols:
+        if col not in cat.columns:
+            if col in ("code", "rows"):
+                cat[col] = pd.Series(dtype="Int64")
+            else:
+                cat[col] = pd.Series(dtype="string")
+    # cast light dtypes
+    if "code" in cat.columns:
+        cat["code"] = pd.to_numeric(cat["code"], errors="coerce").astype("Int64")
+    if "rows" in cat.columns:
+        cat["rows"] = pd.to_numeric(cat["rows"], errors="coerce").astype("Int64")
+    # reorder (keep any extra legacy columns at the end)
+    extras = [c for c in cat.columns if c not in expected_cols]
+    return cat[expected_cols + extras]
 
 
 # Public exports
